@@ -1,6 +1,6 @@
 # Chess Website
 
-A browser chess board inspired by the play screen on chess.com. Plain HTML, CSS and JavaScript with no build step and no dependencies.
+A browser chess board inspired by the play screen on chess.com, styled in the colors of the Davis Undergraduate Engineering Network (DUEN): deep plum with gold and cream. Plain HTML, CSS and JavaScript with no build step and no dependencies.
 
 **Live site:** https://kennynakao.github.io/chess-website/
 
