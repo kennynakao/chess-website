@@ -29,7 +29,8 @@ from backend.chess_game import ChessGame, DIFFICULTIES, PromotionRequired, Stock
 MAX_BODY = 4096
 SESSION_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
 REQUEST_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
-ROUTES = {"/api/new", "/api/move", "/api/undo"}
+PRESENCE_ROUTES = {"/api/heartbeat", "/api/release"}
+ROUTES = {"/api/new", "/api/move", "/api/undo"} | PRESENCE_ROUTES
 
 
 class ApiError(Exception):
@@ -41,7 +42,7 @@ class ApiError(Exception):
 class GameService:
     """Serialize changes; commit game and deduplication record atomically."""
     def __init__(self, database: str | Path, engine_factory=StockfishPlayer,
-                 clock=time.time, lease_seconds=3600):
+                 clock=time.time, lease_seconds=90):
         self.lock = threading.RLock()
         self.clock, self.lease_seconds = clock, lease_seconds
         self.engine_factory = engine_factory
@@ -62,9 +63,17 @@ class GameService:
             "level": "beginner", "uciMoves": [], "owner": None, "leaseExpiresAt": 0,
         }
         self.game = self._restore(self.record)
+        # Migrate old hour-long leases without reviving an expired controller.
+        if not self.game.started or self.game.board.is_game_over(claim_draw=True):
+            self.record.update(owner=None, leaseExpiresAt=0)
+        elif self.record["leaseExpiresAt"] > self.clock() + self.lease_seconds:
+            self.record["leaseExpiresAt"] = self.clock() + self.lease_seconds
         if not row:
             with self.db:
                 self.db.execute("INSERT INTO state VALUES(1,?)", (json.dumps(self.record),))
+        elif self.record != json.loads(row[0]):
+            with self.db:
+                self.db.execute("UPDATE state SET value=? WHERE id=1", (json.dumps(self.record),))
         self._connect_engine()
 
     @staticmethod
@@ -95,7 +104,13 @@ class GameService:
         record, game = record or self.record, game or self.game
         return (record["owner"] is not None and record["owner"] != session
                 and record["leaseExpiresAt"] > self.clock()
+                and game.started
                 and not game.board.is_game_over(claim_draw=True))
+
+    def _is_controller(self, session, record=None, game=None):
+        record, game = record or self.record, game or self.game
+        return (record["owner"] == session and record["leaseExpiresAt"] > self.clock()
+                and game.started and not game.board.is_game_over(claim_draw=True))
 
     def _snapshot(self, session, record=None, game=None):
         record, game = record or self.record, game or self.game
@@ -129,6 +144,7 @@ class GameService:
             "result": game.result_text(), "lastMove": game.last_move.uci() if game.last_move else None,
             "canControl": not self._owned(session, record, game),
             "occupied": self._owned(session, record, game),
+            "isController": self._is_controller(session, record, game),
             "leaseExpiresAt": record["leaseExpiresAt"],
         }
 
@@ -142,6 +158,8 @@ class GameService:
             raise ApiError(400, "Missing or invalid player session.", "invalid_session")
         if route not in ROUTES:
             raise ApiError(404, "Unknown API route.", "not_found")
+        if route in PRESENCE_ROUTES:
+            return self._presence(route, body, session)
         request_id = body.get("requestId")
         if not isinstance(request_id, str) or not REQUEST_PATTERN.fullmatch(request_id):
             raise ApiError(400, "A valid requestId is required.", "invalid_request")
@@ -153,7 +171,12 @@ class GameService:
                 if not hmac.compare_digest(cached[0], fingerprint):
                     raise ApiError(409, "requestId was already used for a different command.", "request_collision")
                 logging.info("REPLAY request=%s", request_id)
-                return json.loads(cached[1])
+                response = json.loads(cached[1])
+                current = self._snapshot(session)
+                # A retry recovers the original game transaction, never its old lease.
+                for key in ("isController", "canControl", "occupied", "leaseExpiresAt"):
+                    response[key] = current[key]
+                return response
             revision = body.get("expectedRevision")
             if type(revision) is not int or not isinstance(body.get("expectedGameId"), str):
                 raise ApiError(400, "expectedGameId and integer expectedRevision are required.", "invalid_version")
@@ -216,6 +239,8 @@ class GameService:
             record.update(revision=record["revision"] + 1, started=candidate.started,
                           level=candidate.level, uciMoves=[m.uci() for m in candidate.board.move_stack],
                           owner=session, leaseExpiresAt=self.clock() + self.lease_seconds)
+            if candidate.board.is_game_over(claim_draw=True):
+                record.update(owner=None, leaseExpiresAt=0)
             response = {**self._snapshot(session, record, candidate), **extra, "requestId": request_id}
             with self.db:
                 self.db.execute("UPDATE state SET value=? WHERE id=1", (json.dumps(record),))
@@ -225,6 +250,31 @@ class GameService:
                          route, request_id, record["gameId"], record["revision"],
                          extra.get("human", {}).get("uci", "-"), (extra.get("computer") or {}).get("uci", "-"), candidate.board.fen())
             return response
+
+    def _presence(self, route, body, session):
+        with self.lock:
+            expected_game = body.get("expectedGameId")
+            if not isinstance(expected_game, str):
+                raise ApiError(400, "expectedGameId is required.", "invalid_version")
+            if expected_game != self.record["gameId"]:
+                raise ApiError(409, "The game changed. Reload its current state.", "stale_state", state=self._snapshot(session))
+            record = copy.deepcopy(self.record)
+            if route == "/api/heartbeat":
+                if not self._is_controller(session):
+                    raise ApiError(409, "You no longer control this board.", "not_controller", state=self._snapshot(session))
+                record["leaseExpiresAt"] = self.clock() + self.lease_seconds
+            else:
+                if record["owner"] is None:
+                    return self._snapshot(session)
+                if record["owner"] != session:
+                    raise ApiError(409, "You cannot release another player's board.", "not_controller", state=self._snapshot(session))
+                record.update(owner=None, leaseExpiresAt=0)
+            with self.db:
+                self.db.execute("UPDATE state SET value=? WHERE id=1", (json.dumps(record),))
+            self.record = record
+            if route == "/api/release":
+                logging.info("RELEASE game=%s revision=%s", record["gameId"], record["revision"])
+            return self._snapshot(session)
 
     def close(self):
         with self.lock:

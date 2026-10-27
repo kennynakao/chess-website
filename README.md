@@ -34,9 +34,17 @@ The Pi stores only `CHESS_RELAY_TOKEN` and `CHESS_STATE_PATH` in
 The relay token is never returned to a browser. The player cookie is Secure,
 HttpOnly, and SameSite=Strict and expires after 24 hours.
 
-One browser session controls the board at a time. Other sessions can view it.
-The control lease lasts one hour, refreshed by successful commands. Remote play
-is untimed; clocks must be implemented on the Pi before timed remote play.
+One browser session controls the board at a time. Other sessions can watch, but
+the Pi rejects their moves, takebacks, and new-game requests while occupied.
+Successful commands and a heartbeat every 20 seconds renew a 90-second control
+lease. Only a visible game page sends heartbeats. Closing the page, losing its
+connection, or leaving it in the background releases control within 90 seconds
+of the last successful renewal. The owner can use **Release board** immediately.
+A game ending also frees the board. Refreshing preserves the reconnect grace
+period; status polling by spectators never renews another player's lease.
+Expired heartbeats cannot reclaim control. Competing commands are serialized
+on the Pi, and only one session can acquire the board. Remote play is untimed;
+clocks must be implemented on the Pi before timed remote play.
 
 ## Pi setup
 

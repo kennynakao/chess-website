@@ -17,7 +17,7 @@ function json(res, status, data) { res.statusCode=status;res.setHeader('Content-
 module.exports = async function handler(req,res) {
   res.setHeader('Cache-Control','no-store'); res.setHeader('X-Content-Type-Options','nosniff');
   const action = new URL(req.url,'https://placeholder.invalid').pathname.split('/').filter(Boolean).pop();
-  const permitted = {login:'POST',logout:'POST',status:'GET',new:'POST',move:'POST',undo:'POST'};
+  const permitted = {login:'POST',logout:'POST',status:'GET',new:'POST',move:'POST',undo:'POST',heartbeat:'POST',release:'POST'};
   if (!permitted[action]) return json(res,404,{ok:false,error:'Unknown route.'});
   if (req.method !== permitted[action]) return json(res,405,{ok:false,error:'Method not allowed.'});
   if (!process.env.CHESS_SESSION_SECRET || !process.env.CHESS_ACCESS_CODE || !process.env.PI_API_URL || !process.env.CHESS_RELAY_TOKEN) return json(res,503,{ok:false,error:'The Pi connection is not configured yet.'});

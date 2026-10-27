@@ -32,16 +32,41 @@
 
   const Backend = {
     available: false, engine: false, authenticated: false, pending: false,
-    canControl: false, engineError: null, error: null, levels: [],
+    canControl: false, isController: false, occupied: false, engineError: null, error: null, levels: [],
+    epoch: 0, releasing: false, presencePending: false, pageActive: true, renewalEnabled: true, suppressedGameId: null,
     revision: 0, gameId: null, snapshot: null, probing: null,
+    suppressRenewal() {
+      this.renewalEnabled = false; this.suppressedGameId = this.gameId;
+      try { sessionStorage.setItem('duen.chess.releasedGame', this.gameId); } catch (err) { /* retain in-memory intent */ }
+    },
+    restoreRenewalPolicy(gameId) {
+      try {
+        if (sessionStorage.getItem('duen.chess.releasedGame') === gameId) this.suppressedGameId = gameId;
+      } catch (err) { /* storage may be disabled */ }
+      if (this.suppressedGameId === gameId) this.renewalEnabled = false;
+    },
+    resumeRenewal() {
+      this.renewalEnabled = this.isController;
+      if (!this.isController) return;
+      this.suppressedGameId = null;
+      try { sessionStorage.removeItem('duen.chess.releasedGame'); } catch (err) { /* current page can still renew */ }
+    },
     accept(data) {
       if (this.snapshot && data.revision < this.revision) return this.snapshot;
+      this.restoreRenewalPolicy(data.gameId);
       this.available = true;
       this.authenticated = true;
       this.engine = !!data.engine;
       this.engineError = data.engineError || null;
       this.levels = Array.isArray(data.levels) ? data.levels : [];
-      this.canControl = data.canControl === true;
+      const expired = data.isController && Number(data.leaseExpiresAt) * 1000 <= Date.now();
+      const lostControl = this.isController && (!data.isController || expired);
+      this.canControl = data.canControl === true && !expired;
+      this.isController = data.isController === true && !expired;
+      this.occupied = data.occupied === true;
+      if (state.mode === 'engine' && (lostControl || !this.canControl)) {
+        state.premove = null; state.selected = null; state.legal = [];
+      }
       this.revision = data.revision;
       this.gameId = data.gameId;
       this.snapshot = data;
@@ -73,31 +98,40 @@
     },
     async probe() {
       if (this.probing) return this.probing;
+      const epoch = this.epoch;
       this.probing = (async () => {
-        try { return this.accept(await this.request('api/status')); }
-        catch (err) { this.available = false; this.error = err.message; return null; }
+        try {
+          const data = await this.request('api/status');
+          return epoch === this.epoch ? this.accept(data) : null;
+        }
+        catch (err) { if (epoch === this.epoch) { this.available = false; this.error = err.message; } return null; }
         finally { this.probing = null; }
       })();
       return this.probing;
     },
     async call(path, body) {
-      if (this.pending) throw new Error('Wait for the Pi to finish the current move.');
+      if (this.pending || this.releasing) throw new Error('Wait for the Pi to finish the current request.');
       if (!this.available || !this.authenticated) throw new Error('Reconnect to the Pi before making a move.');
       const payload = { ...body, requestId: crypto.randomUUID(), expectedRevision: this.revision, expectedGameId: this.gameId };
-      this.pending = true;
+      this.pending = true; this.epoch++;
       renderConnection(); renderControls(); renderNewGamePanel();
       try {
         for (let attempt = 0; attempt < 2; attempt++) {
-          try { return this.accept(await this.request(path, payload, 25000)); }
+          try {
+            const data = this.accept(await this.request(path, payload, 25000));
+            this.resumeRenewal();
+            return data;
+          }
           catch (err) {
             // A retry uses the same request ID and revision; the Pi deduplicates it.
             if (attempt === 0 && (!err.status || [502, 503, 504].includes(err.status))) continue;
             this.error = err.message;
+            if (err.data && err.data.state) this.accept(err.data.state);
             if (!err.status || err.status >= 500) this.available = false;
             throw err;
           }
         }
-      } finally { this.pending = false; renderConnection(); renderControls(); renderNewGamePanel(); }
+      } finally { this.pending = false; this.epoch++; renderConnection(); renderControls(); renderNewGamePanel(); }
     },
     newGame(level) { return this.call('api/new', { level }); },
     move(from, to, promotion) { return this.call('api/move', { from, to, promotion: promotion || null }); },
@@ -154,7 +188,7 @@
     modalSub: $('#modal-sub'), modalScore: $('#modal-score'), modalNameW: $('#modal-name-w'), modalNameB: $('#modal-name-b'),
     modalAvW: $('#modal-av-w'), modalAvB: $('#modal-av-b'), modalRematch: $('#modal-rematch'), modalNew: $('#modal-new'),
     soundToggle: $('#sound-toggle'),
-    connection: $('#connection-status'), reconnect: $('#reconnect-pi'),
+    connection: $('#connection-status'), reconnect: $('#reconnect-pi'), release: $('#release-board'), continueBoard: $('#continue-board'),
     access: $('#access-overlay'), accessForm: $('#access-form'), accessCode: $('#access-code'), accessError: $('#access-error'), accessSubmit: $('#access-submit'),
   };
 
@@ -486,15 +520,16 @@
   }
 
   function renderControls() {
+    const busy = Backend.pending || Backend.releasing;
     const playing = state.status === 'playing';
     const plies = state.game.history.length;
     el.btnDraw.disabled = state.mode === 'engine' || !playing || state.thinking;
-    el.btnResign.disabled = state.mode === 'engine' || !playing || Backend.pending;
+    el.btnResign.disabled = state.mode === 'engine' || !playing || busy;
     el.resignLabel.textContent = playing && plies < 2 ? 'Abort' : 'Resign';
-    el.btnTakeback.disabled = !playing || plies === 0 || state.thinking || Backend.pending ||
+    el.btnTakeback.disabled = !playing || plies === 0 || state.thinking || busy ||
       (state.mode === 'engine' && (!Backend.available || !Backend.canControl));
-    el.btnRematch.disabled = el.btnNewGame.disabled = Backend.pending;
-    $('#remote-newgame').disabled = Backend.pending || state.thinking;
+    el.btnRematch.disabled = el.btnNewGame.disabled = busy;
+    $('#remote-newgame').disabled = busy || state.thinking || (Backend.authenticated && Backend.occupied);
     const cur = state.viewPly === null ? plies : state.viewPly;
     el.navFirst.disabled = el.navPrev.disabled = cur === 0;
     el.navNext.disabled = el.navLast.disabled = cur >= plies;
@@ -511,13 +546,25 @@
   }
 
   function renderConnection() {
+    const saved = Backend.snapshot && Backend.snapshot.started && !Backend.snapshot.gameOver;
     const message = !Backend.authenticated ? 'Unlock the Pi to play online' :
+      Backend.releasing ? 'Releasing the board…' :
       Backend.pending ? 'Pi is processing your move…' :
       !Backend.available ? 'Pi offline — reconnecting. Your game is saved.' :
+      state.mode === 'friend' ? 'Local game · the Pi board is separate' :
+      Backend.occupied ? 'Board in use · watch only' :
       !Backend.engine ? 'Pi connected — Stockfish unavailable' :
-      Backend.canControl ? 'Connected to Raspberry Pi · Stockfish ready' : 'Watching the Pi · another player has control';
+      Backend.isController && !Backend.renewalEnabled ? 'Release not confirmed · renewal stopped' :
+      Backend.isController ? 'You control the board · Stockfish ready' :
+      saved ? 'Board available · start a new game or continue the saved game' : 'Board available · start a new game';
     el.connection.textContent = message;
+    el.connection.classList.toggle('watch-only', Backend.occupied && state.mode === 'engine');
     el.reconnect.textContent = Backend.authenticated ? 'Reconnect' : 'Unlock';
+    el.release.classList.toggle('hidden', !Backend.isController && !Backend.releasing);
+    el.release.disabled = Backend.pending || Backend.releasing || state.thinking;
+    el.release.textContent = Backend.releasing ? 'Releasing…' : 'Release board';
+    el.continueBoard.classList.toggle('hidden', !Backend.available || !Backend.canControl || Backend.isController || !saved);
+    el.continueBoard.disabled = Backend.pending || Backend.releasing || state.thinking;
   }
 
   function renderNewGamePanel() {
@@ -532,12 +579,12 @@
     }
     el.playBotTitle.textContent = 'Play on the Pi';
     el.playBotSub.textContent = 'You play White · unlimited time';
-    el.playBtn.textContent = Backend.pending ? 'Please wait…' : 'Play on the Pi';
-    el.playBtn.disabled = el.playBot.disabled = Backend.pending || (Backend.authenticated && (!Backend.available || !Backend.engine || !Backend.canControl));
-    el.playFriend.disabled = Backend.pending;
+    el.playBtn.textContent = Backend.pending || Backend.releasing ? 'Please wait…' : 'Start new game';
+    el.playBtn.disabled = el.playBot.disabled = Backend.pending || Backend.releasing || (Backend.authenticated && (!Backend.available || !Backend.engine || !Backend.canControl));
+    el.playFriend.disabled = Backend.pending || Backend.releasing;
     el.backendStatus.textContent = !Backend.authenticated ? 'Use your board access code to connect.' :
       !Backend.available ? (Backend.error || 'The Pi is offline. Reconnect when it is online.') :
-      !Backend.canControl ? 'Another player is using this board. You can watch their game.' :
+      !Backend.canControl ? 'Board in use. You can watch, but only its current player can make moves.' :
       !Backend.engine ? (Backend.engineError || 'Stockfish is not ready on the Pi.') : 'Your moves and the computer’s replies are processed on the Raspberry Pi.';
     el.backendStatus.className = 'backend-status ' + (Backend.available && Backend.engine ? 'ok' : 'warn');
     el.soundToggle.classList.toggle('off', !state.sound);
@@ -583,14 +630,78 @@
   }
 
   async function reconnectPi({ force = false } = {}) {
-    if (Backend.pending || state.thinking || (!force && state.mode === 'friend' && state.status === 'playing')) return;
+    if (Backend.pending || Backend.releasing || Backend.presencePending || state.thinking || (!force && state.mode === 'friend' && state.status === 'playing')) return;
     const previousGame = Backend.gameId, previousRevision = Backend.revision, generation = state.gameId;
+    const previousControl = Backend.canControl, previousController = Backend.isController;
     const data = await Backend.probe();
-    if (data && generation === state.gameId && !Backend.pending && !state.thinking && (force || state.mode === 'engine' &&
+    if (data && generation === state.gameId && !Backend.pending && !Backend.releasing && !state.thinking && (force || state.mode === 'engine' &&
         (previousGame !== data.gameId || previousRevision !== data.revision || !sameBoard(state.game.fen(), data.fen)))) {
       try { applyRemoteState(data); } catch (err) { Backend.available = false; Backend.error = err.message; toast(err.message, 4500); }
     }
     renderNewGamePanel(); renderControls();
+    if (previousControl !== Backend.canControl || previousController !== Backend.isController) renderBoard();
+  }
+
+  function updatePresence(data, generation) {
+    const previousGame = Backend.gameId, previousRevision = Backend.revision;
+    const previousControl = Backend.canControl, previousController = Backend.isController;
+    const current = Backend.accept(data);
+    if (state.mode === 'engine' && generation === state.gameId &&
+        !Backend.pending && !Backend.releasing &&
+        (previousGame !== current.gameId || previousRevision !== current.revision ||
+         !sameBoard(state.game.fen(), current.fen) || state.game.history.length !== current.uciMoves.length)) {
+      applyRemoteState(current);
+    }
+    renderNewGamePanel(); renderControls();
+    if (previousControl !== Backend.canControl || previousController !== Backend.isController) renderBoard();
+  }
+
+  async function heartbeatPi() {
+    if (!Backend.pageActive || !Backend.renewalEnabled || document.hidden || state.mode !== 'engine' || !Backend.isController ||
+        !Backend.available || Backend.pending || Backend.releasing || Backend.presencePending) return;
+    const epoch = ++Backend.epoch, gameId = Backend.gameId, generation = state.gameId;
+    Backend.presencePending = true;
+    try {
+      const data = await Backend.request('api/heartbeat', { expectedGameId: gameId });
+      if (epoch === Backend.epoch && gameId === Backend.gameId && state.mode === 'engine') updatePresence(data, generation);
+    } catch (err) {
+      if (epoch === Backend.epoch && gameId === Backend.gameId && state.mode === 'engine') {
+        if (err.data && err.data.state) updatePresence(err.data.state, generation);
+        else { Backend.available = false; Backend.error = err.message; state.premove = null; renderNewGamePanel(); renderControls(); renderBoard(); }
+      }
+    } finally {
+      Backend.presencePending = false;
+      if (epoch === Backend.epoch) Backend.epoch++;
+    }
+  }
+
+  async function releaseBoard() {
+    if (!Backend.isController || Backend.pending || Backend.releasing || state.thinking) return;
+    const epoch = ++Backend.epoch, gameId = Backend.gameId;
+    Backend.releasing = true; Backend.suppressRenewal();
+    state.premove = null; state.selected = null; state.legal = [];
+    renderNewGamePanel(); renderControls(); renderBoard();
+    try {
+      const data = await Backend.request('api/release', { expectedGameId: gameId });
+      if (epoch === Backend.epoch && gameId === Backend.gameId) Backend.accept(data);
+    } catch (err) {
+      if (epoch === Backend.epoch && gameId === Backend.gameId) {
+        if (err.data && err.data.state) Backend.accept(err.data.state);
+        else { Backend.available = false; Backend.error = err.message; }
+        toast('Could not confirm release. The board becomes available within 90 seconds without a heartbeat.', 5500);
+      }
+    } finally {
+      if (epoch === Backend.epoch) Backend.epoch++;
+      Backend.releasing = false;
+      // The reply updates ownership only; it must not replace a newly started local game.
+      renderNewGamePanel(); renderControls(); renderBoard();
+    }
+  }
+
+  function continueSavedGame() {
+    if (Backend.pending || Backend.releasing || state.thinking || !Backend.available || !Backend.canControl || !Backend.snapshot) return;
+    applyRemoteState(Backend.snapshot);
+    toast('Make your next move to take control of the board.');
   }
 
   // ----------------------------------------------------------------- game flow
@@ -617,7 +728,7 @@
   }
 
   async function startGame(mode, colorPref) {
-    if (Backend.pending || state.thinking) return;
+    if (Backend.pending || Backend.releasing || state.thinking) return;
     if (mode !== 'friend') {
       if (!Backend.authenticated) { showAccess(); return; }
       if (!Backend.available || !Backend.engine || !Backend.canControl) { toast('The Pi is not ready for a new game. Reconnect to check.'); return; }
@@ -625,17 +736,21 @@
       catch (err) { await reconnectPi({ force: true }); toast(err.message, 4500); }
       return;
     }
+    // Stop renewal immediately; release and local presentation proceed independently.
+    const release = Backend.isController ? releaseBoard() : null;
+    if (!release) Backend.epoch++;
     resetGameState();
     state.mode = 'friend'; state.status = 'playing'; state.playerColor = 'w'; state.orientation = 'w';
     state.tc = TIME_CONTROLS.find(t => t.id === 'inf');
     el.access.classList.add('hidden');
     el.panelNew.classList.add('hidden'); el.panelGame.classList.remove('hidden');
-    renderAll(); Sound.play('start');
+    renderAll(); renderConnection(); Sound.play('start');
+    if (release) await release;
   }
 
   function canPremove() {
     return state.status === 'playing' && state.mode !== 'friend' &&
-      (state.mode !== 'engine' || Backend.available && Backend.canControl) &&
+      (state.mode !== 'engine' || Backend.available && Backend.canControl && !Backend.releasing) &&
       state.game.turn !== state.playerColor && !state.pendingPromo && state.viewPly === null;
   }
 
@@ -680,7 +795,7 @@
 
   function canInteract() {
     return state.status === 'playing' && !state.pendingPromo && !state.thinking &&
-      (state.mode !== 'engine' || Backend.available && Backend.canControl && !Backend.pending) &&
+      (state.mode !== 'engine' || Backend.available && Backend.canControl && !Backend.pending && !Backend.releasing) &&
       (state.mode === 'friend' || state.game.turn === state.playerColor);
   }
 
@@ -879,7 +994,7 @@
   }
 
   async function takeback() {
-    if (state.status !== 'playing' || !state.game.history.length || state.thinking || Backend.pending) return;
+    if (state.status !== 'playing' || !state.game.history.length || state.thinking || Backend.pending || Backend.releasing) return;
     if (state.mode === 'engine') {
       try { applyRemoteState(await Backend.undo()); }
       catch (err) { await reconnectPi({ force: true }); toast('Takeback failed: ' + err.message, 4500); }
@@ -1125,7 +1240,7 @@
     startGame(state.mode, nextColor);
   }
   function newGame() {
-    if (Backend.pending || state.thinking) return;
+    if (Backend.pending || Backend.releasing || state.thinking) return;
     state.premove = null;
     clearTimeout(state.botTimer);
     state.gameId++;
@@ -1207,6 +1322,8 @@
     if (!Backend.authenticated) showAccess(); else reconnectPi({ force: true });
   });
   $('#remote-newgame').addEventListener('click', newGame);
+  el.release.addEventListener('click', releaseBoard);
+  el.continueBoard.addEventListener('click', continueSavedGame);
 
   // ----------------------------------------------------------------- boot
 
@@ -1217,6 +1334,9 @@
   renderNewGamePanel();
   renderAll();
   reconnectPi({ force: true });
-  setInterval(() => { if (!document.hidden) reconnectPi(); }, 5000);
+  setInterval(() => { if (Backend.pageActive && !document.hidden) reconnectPi(); }, 5000);
+  setInterval(heartbeatPi, 20000);
+  window.addEventListener('pagehide', () => { Backend.pageActive = false; Backend.epoch++; });
+  window.addEventListener('pageshow', () => { Backend.pageActive = true; reconnectPi(); });
   document.addEventListener('visibilitychange', () => { if (!document.hidden) reconnectPi(); });
 })();

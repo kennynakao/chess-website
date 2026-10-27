@@ -99,6 +99,167 @@ class RemoteGameTests(unittest.TestCase):
         self.command("/api/new", BOB)
         self.assertFalse(self.service.status(ALICE)["canControl"])
 
+    def test_concurrent_players_only_one_can_claim_free_board(self):
+        initial = self.service.status(ALICE)
+        barrier = threading.Barrier(2)
+        results, errors = [], []
+        def claim(player):
+            body = dict(requestId="claim-" + player, expectedGameId=initial["gameId"], expectedRevision=initial["revision"])
+            barrier.wait()
+            try:
+                results.append((player, self.service.mutate("/api/new", body, player)))
+            except ApiError as error:
+                errors.append(error)
+        threads = [threading.Thread(target=claim, args=(player,)) for player in (ALICE, BOB)]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIn(errors[0].code, ("stale_state", "board_busy"))
+        owner = results[0][0]
+        self.assertTrue(self.service.status(owner)["isController"])
+        other = BOB if owner == ALICE else ALICE
+        self.assertTrue(self.service.status(other)["occupied"])
+        self.assertFalse(self.service.status(other)["isController"])
+
+    def test_status_polling_does_not_renew_either_player(self):
+        first, _ = self.command("/api/new")
+        before = copy.deepcopy(self.service.record)
+        for offset in (5, 20, 59, 60, 90):
+            self.now[0] = 1000 + offset
+            for player in (ALICE, BOB):
+                state = self.service.status(player)
+                self.assertEqual(state["leaseExpiresAt"], first["leaseExpiresAt"])
+        self.assertEqual(self.service.record, before)
+        self.assertFalse(self.service.status(ALICE)["isController"])
+        self.assertTrue(self.service.status(BOB)["canControl"])
+
+    def test_heartbeat_only_current_unexpired_owner_and_same_game(self):
+        first, _ = self.command("/api/new")
+        body = {"expectedGameId": first["gameId"]}
+        self.now[0] += 20
+        before = copy.deepcopy(self.service.record)
+        for player, payload, code in ((BOB, body, "not_controller"), (ALICE, {"expectedGameId": "old-game"}, "stale_state")):
+            with self.assertRaises(ApiError) as caught:
+                self.service.mutate("/api/heartbeat", payload, player)
+            self.assertEqual(caught.exception.status, 409)
+            self.assertEqual(caught.exception.code, code)
+            self.assertIn("state", caught.exception.extra)
+            self.assertEqual(self.service.record, before)
+        renewed = self.service.mutate("/api/heartbeat", body, ALICE)
+        self.assertEqual(renewed["leaseExpiresAt"], self.now[0] + 60)
+        self.assertEqual(renewed["revision"], first["revision"])
+        self.assertTrue(renewed["isController"])
+        self.now[0] = renewed["leaseExpiresAt"]
+        with self.assertRaises(ApiError) as caught:
+            self.service.mutate("/api/heartbeat", body, ALICE)
+        self.assertEqual(caught.exception.code, "not_controller")
+        self.assertFalse(caught.exception.extra["state"]["isController"])
+        self.assertEqual(self.service.record["leaseExpiresAt"], renewed["leaseExpiresAt"])
+
+    def test_release_is_idempotent_and_delayed_presence_cannot_steal(self):
+        first, _ = self.command("/api/new")
+        body = {"expectedGameId": first["gameId"]}
+        with self.assertRaises(ApiError):
+            self.service.mutate("/api/release", body, BOB)
+        with self.assertRaises(ApiError):
+            self.service.mutate("/api/release", {"expectedGameId": "old-game"}, ALICE)
+        self.assertTrue(self.service.status(ALICE)["isController"])
+        released = self.service.mutate("/api/release", body, ALICE)
+        self.assertFalse(released["isController"])
+        self.assertTrue(released["canControl"])
+        self.assertEqual(released["revision"], first["revision"])
+        self.assertEqual(self.service.mutate("/api/release", body, ALICE), released)
+        with self.assertRaises(ApiError):
+            self.service.mutate("/api/heartbeat", body, ALICE)
+        # Another player may claim an existing game with a valid move.
+        claimed, _ = self.command("/api/move", BOB, **{"from": "e2", "to": "e4"})
+        self.assertEqual(claimed["gameId"], first["gameId"])
+        self.assertTrue(claimed["isController"])
+        for route in ("/api/release", "/api/heartbeat"):
+            with self.assertRaises(ApiError) as caught:
+                self.service.mutate(route, body, ALICE)
+            self.assertEqual(caught.exception.code, "not_controller")
+        self.assertTrue(self.service.status(BOB)["isController"])
+        self.now[0] += 61
+        undone, _ = self.command("/api/undo", ALICE)
+        self.assertTrue(undone["isController"])
+        self.assertEqual(undone["uciMoves"], [])
+
+    def test_replayed_command_never_renews_or_returns_stale_ownership(self):
+        first, body = self.command("/api/new")
+        self.now[0] += 20
+        replay = self.service.mutate("/api/new", body, ALICE)
+        self.assertEqual(replay["leaseExpiresAt"], first["leaseExpiresAt"])
+        self.service.mutate("/api/release", {"expectedGameId": first["gameId"]}, ALICE)
+        replay = self.service.mutate("/api/new", body, ALICE)
+        self.assertFalse(replay["isController"])
+        self.assertEqual(replay["leaseExpiresAt"], 0)
+        claimed, _ = self.command("/api/move", BOB, **{"from": "e2", "to": "e4"})
+        replay = self.service.mutate("/api/new", body, ALICE)
+        self.assertFalse(replay["isController"])
+        self.assertFalse(replay["canControl"])
+        self.assertTrue(replay["occupied"])
+        self.assertEqual(replay["leaseExpiresAt"], claimed["leaseExpiresAt"])
+        self.assertEqual(replay["revision"], first["revision"])
+        self.assertEqual(self.service.status(BOB)["revision"], claimed["revision"])
+
+    def test_finished_game_releases_controller_automatically(self):
+        replies = iter(("e7e5", "d8h4"))
+        self.engine.choose_move = lambda board, level: chess.Move.from_uci(next(replies))
+        self.command("/api/new")
+        self.command("/api/move", **{"from": "f2", "to": "f3"})
+        finished, _ = self.command("/api/move", **{"from": "g2", "to": "g4"})
+        self.assertTrue(finished["gameOver"])
+        self.assertFalse(finished["isController"])
+        self.assertEqual(finished["leaseExpiresAt"], 0)
+        self.assertIsNone(self.service.record["owner"])
+        self.assertTrue(self.service.status(BOB)["canControl"])
+        with self.assertRaises(ApiError):
+            self.service.mutate("/api/heartbeat", {"expectedGameId": finished["gameId"]}, ALICE)
+        self.service.close()
+        self.service = GameService(self.path, lambda: self.engine, lambda: self.now[0])
+        self.assertIsNone(self.service.record["owner"])
+        self.assertEqual(self.service.status(BOB)["outcome"]["reason"], "checkmate")
+
+    def test_heartbeat_release_and_migration_persist_without_changing_game(self):
+        first, _ = self.command("/api/new")
+        body = {"expectedGameId": first["gameId"]}
+        self.now[0] += 20
+        renewed = self.service.mutate("/api/heartbeat", body, ALICE)
+        self.service.close()
+        self.service = GameService(self.path, lambda: self.engine, lambda: self.now[0], lease_seconds=60)
+        self.assertEqual(self.service.status(ALICE)["leaseExpiresAt"], renewed["leaseExpiresAt"])
+        self.assertTrue(self.service.status(ALICE)["isController"])
+        # Old installs used an hour-long lease. Startup caps it at 90 seconds.
+        self.service.record["leaseExpiresAt"] = self.now[0] + 3600
+        with self.service.db:
+            self.service.db.execute("UPDATE state SET value=? WHERE id=1", (json.dumps(self.service.record),))
+        self.service.close()
+        self.service = GameService(self.path, lambda: self.engine, lambda: self.now[0])
+        migrated = self.service.status(ALICE)
+        self.assertEqual(migrated["leaseExpiresAt"], self.now[0] + 90)
+        self.assertEqual(migrated["revision"], first["revision"])
+        self.assertEqual(migrated["gameId"], first["gameId"])
+        self.assertEqual(migrated["uciMoves"], first["uciMoves"])
+        self.service.mutate("/api/release", body, ALICE)
+        self.service.close()
+        self.service = GameService(self.path, lambda: self.engine, lambda: self.now[0])
+        self.assertEqual(self.service.status(ALICE)["leaseExpiresAt"], 0)
+        self.assertFalse(self.service.status(ALICE)["isController"])
+        self.assertTrue(self.service.status(BOB)["canControl"])
+
+    def test_expired_lease_stays_expired_after_restart(self):
+        first, _ = self.command("/api/new")
+        self.now[0] = first["leaseExpiresAt"] + 1
+        self.service.close()
+        self.service = GameService(self.path, lambda: self.engine, lambda: self.now[0])
+        self.assertEqual(self.service.status(ALICE)["leaseExpiresAt"], first["leaseExpiresAt"])
+        self.assertFalse(self.service.status(ALICE)["isController"])
+        self.assertTrue(self.service.status(BOB)["canControl"])
+        with self.assertRaises(ApiError):
+            self.service.mutate("/api/heartbeat", {"expectedGameId": first["gameId"]}, ALICE)
+
     def test_failed_engine_and_illegal_moves_do_not_commit(self):
         self.command("/api/new")
         before = copy.deepcopy(self.service.record)
@@ -198,6 +359,18 @@ class RemoteGameTests(unittest.TestCase):
             self.assertEqual(status, 413)
             status, _ = request("/api/new", "POST", "[]", headers={"Content-Type": "application/json"})
             self.assertEqual(status, 400)
+            started, _ = self.command("/api/new")
+            presence_body = json.dumps({"expectedGameId": started["gameId"]})
+            headers = {"Content-Type": "application/json"}
+            for path in ("/api/heartbeat", "/api/release"):
+                self.assertEqual(request(path, "POST", presence_body, False, headers)[0], 401)
+            self.assertEqual(request("/api/heartbeat", "POST", presence_body, headers=headers)[0], 200)
+            status, result = request("/api/release", "POST", presence_body, headers=headers)
+            self.assertEqual(status, 200)
+            self.assertFalse(result["isController"])
+            status, result = request("/api/heartbeat", "POST", presence_body, headers=headers)
+            self.assertEqual(status, 409)
+            self.assertFalse(result["state"]["isController"])
         finally:
             server.shutdown(); server.server_close(); thread.join()
 

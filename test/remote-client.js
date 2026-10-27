@@ -6,21 +6,24 @@ const Chess = require('../chess.js');
 const elements = new Map();
 function node() { return { addEventListener() {}, setAttribute() {}, classList: { add() {}, remove() {}, toggle() {} }, style: {}, dataset: {}, value:'' }; }
 const document = { querySelector(s) { if (!elements.has(s)) elements.set(s,node()); return elements.get(s); }, querySelectorAll: () => [], addEventListener() {} };
+const stored = new Map();
+const sessionStorage = { getItem:key=>stored.get(key)||null, setItem:(key,value)=>stored.set(key,value), removeItem:key=>stored.delete(key) };
 let handler, uuid=0;
-const context = { Chess, document, console, setTimeout: () => 1, clearTimeout() {}, setInterval() {}, performance: { now: () => 0 }, AbortController,
+const context = { Chess, document, sessionStorage, console, setTimeout: () => 1, clearTimeout() {}, setInterval() {}, performance: { now: () => 0 }, AbortController,
  crypto: { randomUUID: () => 'test-request-'+(++uuid) }, fetch: (...args) => handler(...args) };
 vm.createContext(context);
 let source = fs.readFileSync(require.resolve('../app.js'),'utf8');
 const html = fs.readFileSync(require.resolve('../index.html'),'utf8');
 for (const match of source.matchAll(/\$\('#([a-z][a-z0-9-]*)'\)/g)) assert(html.includes('id="'+match[1]+'"'), 'missing element '+match[1]);
 source=source.slice(0,source.indexOf('  // ----------------------------------------------------------------- boot'))+`
+ const renderOwnership = renderConnection;
  renderBoard = renderAll = renderPlayers = renderControls = renderNewGamePanel = renderConnection = hideModal = toast = () => {};
  Sound.play = () => {};
- globalThis.app={Backend,state,applyRemoteState,startGame,requestEngineMove,reconnectPi,canInteract,canPremove,queuePremove,commitMove,takeback};
+ globalThis.app={Backend,state,applyRemoteState,startGame,requestEngineMove,reconnectPi,canInteract,canPremove,queuePremove,commitMove,takeback,heartbeatPi,releaseBoard,continueSavedGame,renderOwnership};
 })();`;
 vm.runInContext(source,context);
 const a=context.app,b=a.Backend,s=a.state;
-function snapshot(moves=[],rev=0,extra={}) { const g=new Chess();moves.forEach(m=>g.move(m));return {ok:true,device:'chessboard',engine:true,levels:[{id:'beginner',label:'Beginner'}],level:'beginner',canControl:true,revision:rev,gameId:'game-1',started:true,fen:g.fen(),uciMoves:moves,gameOver:false,...extra}; }
+function snapshot(moves=[],rev=0,extra={}) { const g=new Chess();moves.forEach(m=>g.move(m));return {ok:true,device:'chessboard',engine:true,levels:[{id:'beginner',label:'Beginner'}],level:'beginner',canControl:true,isController:false,occupied:false,leaseExpiresAt:0,revision:rev,gameId:'game-1',started:true,fen:g.fen(),uciMoves:moves,gameOver:false,...extra}; }
 function response(body,status=200) { return {ok:status<400,status,json:async()=>body}; }
 (async()=>{
  a.applyRemoteState(snapshot(['e2e4','e7e5'],2));
@@ -78,4 +81,77 @@ function response(body,status=200) { return {ok:status<400,status,json:async()=>
  a.applyRemoteState(snapshot([],11,{gameOver:true,outcome:{winner:null,result:'1/2-1/2',reason:'threefold repetition'}}));
  assert.equal(s.status,'over');assert.equal(s.result.reason,'threefold repetition');
  console.log('PASS Pi outcome remains authoritative even when local rules have not ended the game');
+ const owned={isController:true,leaseExpiresAt:Date.now()/1000+90};
+ a.applyRemoteState(snapshot([],12,owned));b.renewalEnabled=true;
+ let finishHeartbeat,finishRelease;let heartbeats=0;
+ handler=(path,opts)=>{
+   assert.deepEqual(JSON.parse(opts.body),{expectedGameId:'game-1'});
+   if(path==='/api/heartbeat'){heartbeats++;return new Promise(resolve=>{finishHeartbeat=resolve;});}
+   if(path==='/api/release')return new Promise(resolve=>{finishRelease=resolve;});
+   throw new Error('unexpected path '+path);
+ };
+ const beating=a.heartbeatPi();const releasing=a.releaseBoard();
+ assert.equal(b.releasing,true);assert.equal(a.canInteract(),false);
+ s.game.move('e2e4');assert.equal(a.canPremove(),false);
+ await a.heartbeatPi();assert.equal(heartbeats,1);
+ finishRelease(response(snapshot([],12)));await releasing;
+ assert.equal(b.isController,false);
+ finishHeartbeat(response(snapshot([],12,owned)));await beating;
+ assert.equal(b.isController,false);assert.equal(b.canControl,true);assert.equal(b.releasing,false);
+ console.log('PASS release blocks play and renewal; a delayed heartbeat cannot restore ownership');
+ a.applyRemoteState(snapshot([],13,owned));
+ let staleStatus;
+ handler=(path)=>path==='/api/status'?new Promise(resolve=>{staleStatus=resolve;}):Promise.resolve(response(snapshot([],13)));
+ const probing=b.probe();await a.releaseBoard();staleStatus(response(snapshot([],13,owned)));await probing;
+ assert.equal(b.isController,false);
+ console.log('PASS a delayed same-revision status cannot undo an explicit release');
+ sessionStorage.removeItem('duen.chess.releasedGame');b.suppressedGameId=null;a.applyRemoteState(snapshot([],14,owned));b.renewalEnabled=true;let presenceCalls=0;
+ handler=async()=>{presenceCalls++;return response(snapshot([],14,owned));};
+ document.hidden=true;await a.heartbeatPi();document.hidden=false;
+ b.pageActive=false;await a.heartbeatPi();b.pageActive=true;
+ s.mode='friend';await a.heartbeatPi();s.mode='engine';
+ assert.equal(presenceCalls,0);
+ await a.heartbeatPi();assert.equal(presenceCalls,1);
+ console.log('PASS only the visible active remote player sends a heartbeat');
+ handler=async()=>response({ok:false,error:'expired',state:snapshot([],14,{canControl:false,occupied:true})},409);
+ await a.heartbeatPi();assert.equal(b.isController,false);assert.equal(b.canControl,false);
+ assert.equal(a.canInteract(),false);a.renderOwnership();assert.equal(elements.get('#connection-status').textContent,'Board in use · watch only');
+ console.log('PASS expired ownership becomes watch-only instead of reacquiring through heartbeat');
+ a.applyRemoteState(snapshot([],15,owned));let completeLocalRelease;
+ handler=(path)=>{assert.equal(path,'/api/release');return new Promise(resolve=>{completeLocalRelease=resolve;});};
+ const local=a.startGame('friend');assert.equal(s.mode,'friend');assert.equal(b.releasing,true);
+ s.game.move('d2d4');completeLocalRelease(response(snapshot(['e2e4','e7e5'],15)));await local;
+ assert.equal(s.mode,'friend');assert.equal(s.game.get('d4').type,'p');assert.equal(s.game.get('e4'),null);assert.equal(b.isController,false);
+ console.log('PASS switching to local play releases ownership without replacing the local game');
+ a.applyRemoteState(snapshot(['e2e4','e7e5'],16));s.status='idle';a.continueSavedGame();assert.equal(s.status,'playing');assert.equal(s.game.history.length,2);
+ a.renderOwnership();assert.match(elements.get('#connection-status').textContent,/Board available/);
+ console.log('PASS a free board offers the saved game without claiming it through a read');
+ a.applyRemoteState(snapshot([],17,{isController:true,leaseExpiresAt:Date.now()/1000-1}));
+ assert.equal(b.isController,false);assert.equal(a.canInteract(),false);
+ console.log('PASS an already expired ownership snapshot never enables play');
+ sessionStorage.removeItem('duen.chess.releasedGame');b.suppressedGameId=null;a.applyRemoteState(snapshot([],18,owned));b.renewalEnabled=true;
+ handler=async()=>{throw new TypeError('offline');};await a.releaseBoard();
+ assert.equal(b.renewalEnabled,false);
+ handler=async()=>response(snapshot([],18,owned));await b.probe();assert.equal(b.isController,true);
+ let unintendedRenewal=0;handler=async()=>{unintendedRenewal++;return response(snapshot([],18,owned));};await a.heartbeatPi();
+ assert.equal(unintendedRenewal,0);assert.equal(b.renewalEnabled,false);
+ handler=async()=>response(snapshot(['e2e4','e7e5'],19,owned));await b.move('e2','e4');assert.equal(b.renewalEnabled,true);
+ assert.equal(sessionStorage.getItem('duen.chess.releasedGame'),null);
+ console.log('PASS uncertain release stops renewal until a successful explicit game action');
+ handler=async()=>{throw new TypeError('offline');};await a.releaseBoard();
+ assert.equal(sessionStorage.getItem('duen.chess.releasedGame'),'game-1');
+ // Simulate fresh JavaScript state while retaining this tab's storage across reload.
+ b.renewalEnabled=true;b.suppressedGameId=null;b.isController=false;
+ b.accept(snapshot(['e2e4','e7e5'],19,owned));
+ assert.equal(b.isController,true);assert.equal(b.renewalEnabled,false);
+ let reloadRenewal=0;handler=async()=>{reloadRenewal++;return response(snapshot(['e2e4','e7e5'],19,owned));};
+ await a.heartbeatPi();assert.equal(reloadRenewal,0);
+ handler=async()=>response(snapshot(['e2e4','e7e5','g1f3','b8c6'],20,owned));await b.move('g1','f3');
+ assert.equal(b.renewalEnabled,true);assert.equal(sessionStorage.getItem('duen.chess.releasedGame'),null);
+ console.log('PASS release intent survives reload and clears only after an explicit successful game action');
+ const originalStorageSet=sessionStorage.setItem,originalStorageGet=sessionStorage.getItem;
+ sessionStorage.setItem=sessionStorage.getItem=()=>{throw new Error('storage disabled');};
+ b.suppressRenewal();b.accept(snapshot(['e2e4','e7e5','g1f3','b8c6'],20,owned));assert.equal(b.renewalEnabled,false);
+ sessionStorage.setItem=originalStorageSet;sessionStorage.getItem=originalStorageGet;
+ console.log('PASS disabled browser storage retains in-memory release intent');
 })().catch(err=>{console.error(err);process.exitCode=1;});

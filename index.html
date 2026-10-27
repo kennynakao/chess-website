@@ -44,7 +44,8 @@
 
 <main class="layout">
   <section class="board-column">
-    <div class="connection-bar"><span id="connection-status" role="status">Connecting to Raspberry Pi…</span><button id="reconnect-pi" type="button">Reconnect</button><button id="remote-newgame" type="button">New game</button></div>
+    <div class="connection-bar"><span id="connection-status" role="status">Connecting to Raspberry Pi…</span><button id="reconnect-pi" type="button">Reconnect</button><button id="remote-newgame" type="button">New game</button><button id="continue-board" class="hidden" type="button">Continue saved game</button><button id="release-board" class="hidden" type="button">Release board</button></div>
+    <p class="ownership-note">One player at a time. Closing this page releases the board within 90 seconds.</p>
     <div class="piece-style-control">
       <span id="piece-style-label">Chess pieces</span>
       <div class="piece-style-options" role="group" aria-labelledby="piece-style-label">

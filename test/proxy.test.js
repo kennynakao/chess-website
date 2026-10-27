@@ -130,6 +130,58 @@ test('mutations preserve request identity and revision for Pi-side deduplication
   assert.equal(calls[0][1].method, 'POST');
 });
 
+for (const action of ['heartbeat', 'release']) {
+  test(`${action} requires a valid player session before contacting the Pi`, async () => {
+    const cookies = [undefined, '__Host-chess-session=invalid', cookieFor({ id: 'a'.repeat(32), exp: Math.floor(Date.now() / 1000) - 1 })];
+    for (const cookie of cookies) {
+      const reply = await request(action, { body: { expectedGameId: 'current-game' }, headers: { cookie } });
+      assert.equal(reply.status, 401);
+      assert.equal(reply.body.loginRequired, true);
+    }
+    assert.equal(calls.length, 0);
+  });
+
+  test(`${action} forwards game identity and the authenticated session without browser credentials`, async () => {
+    const cookie = await login();
+    const player = JSON.parse(Buffer.from(cookie.split('=')[1].split('.')[0], 'base64url')).id;
+    const body = { expectedGameId: 'current-game' };
+    const snapshot = { ok: true, gameId: 'current-game', revision: 8, canControl: action === 'heartbeat', leaseExpiresAt: action === 'heartbeat' ? 1234567890 : 0 };
+    mockReply(200, snapshot);
+    const reply = await request(action, { body, headers: { cookie, authorization: 'Bearer browser-injected', 'x-player-session': 'browser-injected' } });
+    assert.equal(reply.status, 200);
+    assert.deepEqual(reply.body, snapshot);
+    assert.equal(calls.length, 1);
+    const [url, options] = calls[0];
+    assert.equal(String(url), ENV.PI_API_URL + '/api/' + action);
+    assert.equal(options.method, 'POST');
+    assert.deepEqual(JSON.parse(options.body), body);
+    assert.equal(options.headers.Authorization, 'Bearer ' + ENV.CHESS_RELAY_TOKEN);
+    assert.equal(options.headers['X-Player-Session'], player);
+    assert.equal(options.headers.cookie, undefined);
+    assert.equal(reply.headers['set-cookie'], undefined);
+    assert.equal(reply.raw.includes(ENV.CHESS_RELAY_TOKEN), false);
+  });
+
+  test(`${action} cannot bypass method, origin, or JSON checks`, async () => {
+    const cookie = await login();
+    const body = { expectedGameId: 'current-game' };
+    assert.equal((await request(action, { method: 'GET', body, headers: { cookie } })).status, 405);
+    assert.equal((await request(action, { body, headers: { cookie, origin: 'https://attacker.example.invalid' } })).status, 403);
+    assert.equal((await request(action, { body, headers: { cookie, 'content-type': 'text/plain' } })).status, 415);
+    assert.equal(calls.length, 0);
+  });
+
+  test(`${action} preserves Pi ownership conflicts and the current snapshot`, async () => {
+    const cookie = await login();
+    const conflict = { ok: false, code: 'board_busy', error: 'Another player is controlling the board.', state: { gameId: 'current-game', revision: 8, canControl: false } };
+    mockReply(409, conflict);
+    const reply = await request(action, { body: { expectedGameId: 'current-game' }, headers: { cookie } });
+    assert.equal(reply.status, 409);
+    assert.deepEqual(reply.body, conflict);
+    assert.equal(calls.length, 1);
+  });
+}
+
 test('re-login retains player identity while renewing the cookie', async () => {
   const first = await login();
   const second = await login({ cookie: first });
