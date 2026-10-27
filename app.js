@@ -1,10 +1,10 @@
 /* app.js — board UI, clocks, move list, game flow.
  *
  * Rules come from chess.js (client side, for instant hints and highlights).
- * When the page is served by frontend/server.py, computer games go through the
- * chess_game.py backend (python-chess + Stockfish) via the /api/* endpoints.
- * Without a backend (plain static hosting) the computer falls back to a casual
- * random mover so the UI still works.
+ * Computer games go through the same-origin /api/* proxy to the Raspberry Pi
+ * backend (python-chess + Stockfish).
+ * Remote games use the Raspberry Pi as the authoritative game state.
+ * When it is unavailable, moves pause; local pass-and-play remains separate.
  */
 (() => {
   'use strict';
@@ -28,43 +28,76 @@
   ];
   const GROUP_ICON = { Bullet: '🚀', Blitz: '⚡', Rapid: '⏱', Casual: '☕' };
 
-  // ----------------------------------------------------------------- backend (chess_game.py via server.py)
+  // ----------------------------------------------------------------- authenticated Raspberry Pi API
 
   const Backend = {
-    available: false,
-    engine: false,
-    engineError: null,
-    levels: [],
-    async probe() {
+    available: false, engine: false, authenticated: false, pending: false,
+    canControl: false, engineError: null, error: null, levels: [],
+    revision: 0, gameId: null, snapshot: null, probing: null,
+    accept(data) {
+      if (this.snapshot && data.revision < this.revision) return this.snapshot;
+      this.available = true;
+      this.authenticated = true;
+      this.engine = !!data.engine;
+      this.engineError = data.engineError || null;
+      this.levels = Array.isArray(data.levels) ? data.levels : [];
+      this.canControl = data.canControl === true;
+      this.revision = data.revision;
+      this.gameId = data.gameId;
+      this.snapshot = data;
+      this.error = null;
+      return data;
+    },
+    async request(path, body, timeout = 12000) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), timeout);
       try {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 2000);
-        const r = await fetch('api/status', { signal: ctrl.signal, cache: 'no-store' });
-        clearTimeout(timer);
-        if (!r.ok) throw new Error('status ' + r.status);
-        const s = await r.json();
-        this.available = true;
-        this.engine = !!s.engine;
-        this.engineError = s.engineError || null;
-        this.levels = Array.isArray(s.levels) && s.levels.length ? s.levels : [];
-      } catch (e) {
-        this.available = false;
-      }
-      return this.available;
+        const r = await fetch('/' + path.replace(/^\//, ''), {
+          method: body === undefined ? 'GET' : 'POST',
+          credentials: 'same-origin', cache: 'no-store', signal: ctrl.signal,
+          headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
+          body: body === undefined ? undefined : JSON.stringify(body),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || data.ok === false) {
+          const err = new Error(data.error || (r.status === 401 ? 'Enter your board access code.' : 'The Pi could not complete this request.'));
+          err.status = r.status; err.data = data;
+          if (r.status === 401) { this.authenticated = false; this.available = false; showAccess(); }
+          throw err;
+        }
+        return data;
+      } catch (err) {
+        if (!err.status) err.message = 'The Pi is unreachable. Reconnecting…';
+        throw err;
+      } finally { clearTimeout(timer); }
+    },
+    async probe() {
+      if (this.probing) return this.probing;
+      this.probing = (async () => {
+        try { return this.accept(await this.request('api/status')); }
+        catch (err) { this.available = false; this.error = err.message; return null; }
+        finally { this.probing = null; }
+      })();
+      return this.probing;
     },
     async call(path, body) {
-      const r = await fetch(path, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body || {}),
-      });
-      const data = await r.json().catch(() => ({}));
-      if (!r.ok) {
-        const err = new Error(data.error || ('Server error ' + r.status));
-        err.data = data;
-        throw err;
-      }
-      return data;
+      if (this.pending) throw new Error('Wait for the Pi to finish the current move.');
+      if (!this.available || !this.authenticated) throw new Error('Reconnect to the Pi before making a move.');
+      const payload = { ...body, requestId: crypto.randomUUID(), expectedRevision: this.revision, expectedGameId: this.gameId };
+      this.pending = true;
+      renderConnection(); renderControls(); renderNewGamePanel();
+      try {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try { return this.accept(await this.request(path, payload, 25000)); }
+          catch (err) {
+            // A retry uses the same request ID and revision; the Pi deduplicates it.
+            if (attempt === 0 && (!err.status || [502, 503, 504].includes(err.status))) continue;
+            this.error = err.message;
+            if (!err.status || err.status >= 500) this.available = false;
+            throw err;
+          }
+        }
+      } finally { this.pending = false; renderConnection(); renderControls(); renderNewGamePanel(); }
     },
     newGame(level) { return this.call('api/new', { level }); },
     move(from, to, promotion) { return this.call('api/move', { from, to, promotion: promotion || null }); },
@@ -76,7 +109,7 @@
   const state = {
     game: new Chess(),
     status: 'idle',          // idle | playing | over
-    mode: 'computer',        // engine (backend Stockfish) | computer (local casual bot) | friend
+    mode: 'engine',        // engine (backend Stockfish) | computer (local casual bot) | friend
     playerColor: 'w',
     colorPref: 'random',
     level: 'beginner',
@@ -121,6 +154,8 @@
     modalSub: $('#modal-sub'), modalScore: $('#modal-score'), modalNameW: $('#modal-name-w'), modalNameB: $('#modal-name-b'),
     modalAvW: $('#modal-av-w'), modalAvB: $('#modal-av-b'), modalRematch: $('#modal-rematch'), modalNew: $('#modal-new'),
     soundToggle: $('#sound-toggle'),
+    connection: $('#connection-status'), reconnect: $('#reconnect-pi'),
+    access: $('#access-overlay'), accessForm: $('#access-form'), accessCode: $('#access-code'), accessError: $('#access-error'), accessSubmit: $('#access-submit'),
   };
 
   // ----------------------------------------------------------------- sound (synthesised, no assets)
@@ -453,10 +488,13 @@
   function renderControls() {
     const playing = state.status === 'playing';
     const plies = state.game.history.length;
-    el.btnDraw.disabled = !playing || state.thinking;
-    el.btnResign.disabled = !playing;
+    el.btnDraw.disabled = state.mode === 'engine' || !playing || state.thinking;
+    el.btnResign.disabled = state.mode === 'engine' || !playing || Backend.pending;
     el.resignLabel.textContent = playing && plies < 2 ? 'Abort' : 'Resign';
-    el.btnTakeback.disabled = !playing || plies === 0 || state.thinking;
+    el.btnTakeback.disabled = !playing || plies === 0 || state.thinking || Backend.pending ||
+      (state.mode === 'engine' && (!Backend.available || !Backend.canControl));
+    el.btnRematch.disabled = el.btnNewGame.disabled = Backend.pending;
+    $('#remote-newgame').disabled = Backend.pending || state.thinking;
     const cur = state.viewPly === null ? plies : state.viewPly;
     el.navFirst.disabled = el.navPrev.disabled = cur === 0;
     el.navNext.disabled = el.navLast.disabled = cur >= plies;
@@ -472,46 +510,87 @@
     renderControls();
   }
 
-  function renderNewGamePanel() {
-    el.tcLabel.textContent = state.tc.label;
-    $$('button', el.colorPick).forEach((b) => b.classList.toggle('on', b.dataset.color === state.colorPref));
-    // time control menu
-    const groups = [];
-    for (const tc of TIME_CONTROLS) {
-      let g = groups.find((x) => x.name === tc.group);
-      if (!g) groups.push((g = { name: tc.group, items: [] }));
-      g.items.push(tc);
-    }
-    el.tcMenu.innerHTML = groups.map((g) =>
-      `<div class="tc-group"><div class="tc-group-name">${GROUP_ICON[g.name] || ''} ${g.name}</div><div class="tc-grid">` +
-      g.items.map((tc) => `<button type="button" class="tc-opt${tc.id === state.tc.id ? ' on' : ''}" data-tc="${tc.id}">${tc.label}</button>`).join('') +
-      '</div></div>').join('');
-    el.soundToggle.classList.toggle('off', !state.sound);
+  function renderConnection() {
+    const message = !Backend.authenticated ? 'Unlock the Pi to play online' :
+      Backend.pending ? 'Pi is processing your move…' :
+      !Backend.available ? 'Pi offline — reconnecting. Your game is saved.' :
+      !Backend.engine ? 'Pi connected — Stockfish unavailable' :
+      Backend.canControl ? 'Connected to Raspberry Pi · Stockfish ready' : 'Watching the Pi · another player has control';
+    el.connection.textContent = message;
+    el.reconnect.textContent = Backend.authenticated ? 'Reconnect' : 'Unlock';
+  }
 
-    // backend-driven options
-    if (Backend.available) {
-      if (!Backend.levels.some((l) => l.id === state.level)) state.level = (Backend.levels[0] || { id: 'beginner' }).id;
-      el.levelRow.classList.remove('hidden');
-      el.levelPick.innerHTML = Backend.levels.map((l) =>
-        `<button type="button" class="${l.id === state.level ? 'on' : ''}" data-level="${l.id}" title="${l.description || ''}">${l.label}<small>${l.description || ''}</small></button>`).join('');
-      el.colorRow.classList.add('hidden');
-      el.playBotTitle.textContent = 'Play Stockfish';
-      el.playBotSub.textContent = 'You play White · chess_game backend';
-      if (Backend.engine) {
-        el.backendStatus.textContent = 'Connected to the chess_game backend · Stockfish ready';
-        el.backendStatus.className = 'backend-status ok';
-      } else {
-        el.backendStatus.textContent = 'Backend connected, but Stockfish was not found: ' + (Backend.engineError || 'install it or set STOCKFISH_PATH');
-        el.backendStatus.className = 'backend-status warn';
-      }
-    } else {
-      el.levelRow.classList.add('hidden');
-      el.colorRow.classList.remove('hidden');
-      el.playBotTitle.textContent = 'Play Bots';
-      el.playBotSub.textContent = 'Casual game vs the computer';
-      el.backendStatus.textContent = 'No backend detected · casual bot (run frontend/server.py for Stockfish)';
-      el.backendStatus.className = 'backend-status';
+  function renderNewGamePanel() {
+    el.tcLabel.textContent = 'Unlimited';
+    el.tcButton.disabled = true;
+    el.colorRow.classList.add('hidden');
+    el.levelRow.classList.remove('hidden');
+    if (Backend.levels.length) {
+      if (!Backend.levels.some(l => l.id === state.level)) state.level = Backend.levels[0].id;
+      el.levelPick.innerHTML = Backend.levels.map(l =>
+        `<button type="button" class="${l.id === state.level ? 'on' : ''}" data-level="${l.id}">${l.label}<small>${l.description || ''}</small></button>`).join('');
     }
+    el.playBotTitle.textContent = 'Play on the Pi';
+    el.playBotSub.textContent = 'You play White · unlimited time';
+    el.playBtn.textContent = Backend.pending ? 'Please wait…' : 'Play on the Pi';
+    el.playBtn.disabled = el.playBot.disabled = Backend.pending || (Backend.authenticated && (!Backend.available || !Backend.engine || !Backend.canControl));
+    el.playFriend.disabled = Backend.pending;
+    el.backendStatus.textContent = !Backend.authenticated ? 'Use your board access code to connect.' :
+      !Backend.available ? (Backend.error || 'The Pi is offline. Reconnect when it is online.') :
+      !Backend.canControl ? 'Another player is using this board. You can watch their game.' :
+      !Backend.engine ? (Backend.engineError || 'Stockfish is not ready on the Pi.') : 'Your moves and the computer’s replies are processed on the Raspberry Pi.';
+    el.backendStatus.className = 'backend-status ' + (Backend.available && Backend.engine ? 'ok' : 'warn');
+    el.soundToggle.classList.toggle('off', !state.sound);
+    renderConnection();
+  }
+
+  function showAccess() {
+    if (state.mode === 'friend' && state.status === 'playing') return;
+    el.access.classList.remove('hidden');
+  }
+
+  function applyRemoteState(data, { preservePremove = false } = {}) {
+    // A slower response must never render an older position with a newer revision.
+    data = Backend.accept(data);
+    // Reconstruct every ply: FEN alone cannot restore repetition or takeback history.
+    const game = new Chess();
+    const records = [];
+    for (const move of data.uciMoves || []) {
+      const record = game.move(move);
+      if (!record) throw new Error('The Pi returned an invalid move history. Reconnect to reload it.');
+      records.push(record);
+    }
+    if (data.fen && !sameBoard(game.fen(), data.fen)) throw new Error('The Pi position could not be loaded. Reconnect to try again.');
+    const premove = preservePremove ? state.premove : null;
+    clearTimeout(state.botTimer);
+    state.game = new Chess(); state.snapshots = []; pushSnapshot(null);
+    for (const rec of records) pushSnapshot(state.game.move(rec.move));
+    state.gameId++;
+    state.mode = 'engine'; state.playerColor = 'w';
+    state.tc = TIME_CONTROLS.find(t => t.id === 'inf'); state.running = null;
+    state.level = data.level || state.level;
+    state.selected = null; state.legal = []; state.pendingPromo = null; state.drag = null; state.hoverSq = null;
+    state.premove = premove; state.viewPly = null; state.thinking = false;
+    state.result = data.started && data.gameOver ? (data.outcome || state.game.gameOver() ||
+      { winner: null, result: '1/2-1/2', reason: 'confirmed by the Pi' }) : null;
+    state.status = !data.started ? 'idle' : data.gameOver ? 'over' : 'playing';
+    if (state.status === 'over') state.premove = null;
+    el.promo.classList.add('hidden'); el.confirm.classList.add('hidden');
+    el.board.classList.remove('dragging'); hideModal();
+    el.panelNew.classList.toggle('hidden', state.status !== 'idle');
+    el.panelGame.classList.toggle('hidden', state.status === 'idle');
+    renderNewGamePanel(); renderAll();
+  }
+
+  async function reconnectPi({ force = false } = {}) {
+    if (Backend.pending || state.thinking || (!force && state.mode === 'friend' && state.status === 'playing')) return;
+    const previousGame = Backend.gameId, previousRevision = Backend.revision, generation = state.gameId;
+    const data = await Backend.probe();
+    if (data && generation === state.gameId && !Backend.pending && !state.thinking && (force || state.mode === 'engine' &&
+        (previousGame !== data.gameId || previousRevision !== data.revision || !sameBoard(state.game.fen(), data.fen)))) {
+      try { applyRemoteState(data); } catch (err) { Backend.available = false; Backend.error = err.message; toast(err.message, 4500); }
+    }
+    renderNewGamePanel(); renderControls();
   }
 
   // ----------------------------------------------------------------- game flow
@@ -538,35 +617,25 @@
   }
 
   async function startGame(mode, colorPref) {
-    if (mode === 'engine' && !Backend.available) mode = 'computer';
-    resetGameState();
-    const id = state.gameId;
-    state.mode = mode;
-    state.status = 'playing';
-    const pref = colorPref || state.colorPref;
-    state.playerColor = mode === 'engine' ? 'w' : pref === 'random' ? (Math.random() < 0.5 ? 'w' : 'b') : pref;
-    state.orientation = mode === 'friend' ? 'w' : state.playerColor;
-    el.panelNew.classList.add('hidden');
-    el.panelGame.classList.remove('hidden');
-    renderAll();
-
-    if (mode === 'engine') {
-      try {
-        await Backend.newGame(state.level);
-      } catch (e) {
-        if (id !== state.gameId) return;
-        toast('Backend error: ' + e.message + ' — playing the casual bot instead', 4000);
-        state.mode = 'computer';
-        renderAll();
-      }
-      if (id !== state.gameId) return;
+    if (Backend.pending || state.thinking) return;
+    if (mode !== 'friend') {
+      if (!Backend.authenticated) { showAccess(); return; }
+      if (!Backend.available || !Backend.engine || !Backend.canControl) { toast('The Pi is not ready for a new game. Reconnect to check.'); return; }
+      try { applyRemoteState(await Backend.newGame(state.level)); Sound.play('start'); }
+      catch (err) { await reconnectPi({ force: true }); toast(err.message, 4500); }
+      return;
     }
-    Sound.play('start');
-    if (state.mode === 'computer' && state.game.turn !== state.playerColor) scheduleBot();
+    resetGameState();
+    state.mode = 'friend'; state.status = 'playing'; state.playerColor = 'w'; state.orientation = 'w';
+    state.tc = TIME_CONTROLS.find(t => t.id === 'inf');
+    el.access.classList.add('hidden');
+    el.panelNew.classList.add('hidden'); el.panelGame.classList.remove('hidden');
+    renderAll(); Sound.play('start');
   }
 
   function canPremove() {
     return state.status === 'playing' && state.mode !== 'friend' &&
+      (state.mode !== 'engine' || Backend.available && Backend.canControl) &&
       state.game.turn !== state.playerColor && !state.pendingPromo && state.viewPly === null;
   }
 
@@ -611,6 +680,7 @@
 
   function canInteract() {
     return state.status === 'playing' && !state.pendingPromo && !state.thinking &&
+      (state.mode !== 'engine' || Backend.available && Backend.canControl && !Backend.pending) &&
       (state.mode === 'friend' || state.game.turn === state.playerColor);
   }
 
@@ -680,7 +750,7 @@
     renderAll(anim, opts.source === 'engine' || opts.source === 'bot');
 
     const over = g.gameOver();
-    if (over) {
+    if (over && !(state.mode === 'engine' && opts.source !== 'engine')) {
       endGame(over.winner, over.reason);
       return rec;
     }
@@ -698,38 +768,21 @@
 
   /** Send the human move to chess_game.py and play Stockfish's reply. */
   async function requestEngineMove(rec) {
-    const id = state.gameId;
-    state.thinking = true;
-    renderPlayers();
-    renderControls();
+    state.thinking = true; renderPlayers(); renderControls();
     try {
-      const [res] = await Promise.all([
-        Backend.move(sqName(rec.move.from), sqName(rec.move.to), rec.move.promo || null),
-        new Promise((resolve) => setTimeout(resolve, botThinkMilliseconds())),
-      ]);
-      if (id !== state.gameId || state.status !== 'playing') return;
-      state.thinking = false;
-      if (res.computer && res.computer.uci) {
-        const played = commitMove(res.computer.uci, { animate: true, source: 'engine' });
-        if (!played) throw new Error('Stockfish played ' + res.computer.uci + ', which the board rejected');
-      } else {
-        renderPlayers();
-        renderControls();
-      }
-      if (res.fen && !sameBoard(res.fen, state.game.fen())) {
-        clearPremove();
-        console.warn('Board differs from backend', res.fen, state.game.fen());
-        toast('Board is out of sync with the backend — start a new game', 4000);
-      } else {
-        playPremove();
-      }
-    } catch (e) {
-      if (id !== state.gameId) return;
-      state.thinking = false;
-      renderPlayers();
-      renderControls();
-      clearPremove();
-      toast(e.message, 4500);
+      const res = await Backend.move(sqName(rec.move.from), sqName(rec.move.to), rec.move.promo || null);
+      applyRemoteState(res, { preservePremove: true });
+      Sound.play(res.check ? 'check' : 'move');
+      // Metadata is updated before a queued premove starts the next request.
+      playPremove();
+    } catch (err) {
+      state.thinking = false; state.premove = null;
+      // Restore the last confirmed position while status reconciliation runs.
+      const authenticated = Backend.authenticated;
+      if (Backend.snapshot) applyRemoteState(Backend.snapshot);
+      Backend.authenticated = authenticated; Backend.available = false;
+      await reconnectPi({ force: true });
+      renderPlayers(); renderControls(); toast(err.message, 5000);
     }
   }
 
@@ -810,14 +863,14 @@
   function hideModal() { el.modal.classList.add('hidden'); }
 
   function resignOrAbort() {
-    if (state.status !== 'playing') return;
+    if (state.status !== 'playing' || state.mode === 'engine') return;
     if (state.game.history.length < 2) { endGame(null, 'aborted'); toast('Game aborted'); return; }
     const loser = state.mode === 'friend' ? state.game.turn : state.playerColor;
     endGame(opp(loser), 'resignation');
   }
 
   function offerDraw() {
-    if (state.status !== 'playing') return;
+    if (state.status !== 'playing' || state.mode === 'engine') return;
     if (state.mode === 'friend') { endGame(null, 'agreement'); return; }
     const bal = state.game.materialBalance();
     const botAhead = state.playerColor === 'w' ? bal < 0 : bal > 0;
@@ -826,29 +879,15 @@
   }
 
   async function takeback() {
-    if (state.status !== 'playing' || !state.game.history.length || state.thinking) return;
-    const g = state.game;
-    clearTimeout(state.botTimer);
-    state.gameId++;
-    let n = 1;
-    if (state.mode !== 'friend' && g.turn === state.playerColor && g.history.length >= 2) n = 2;
+    if (state.status !== 'playing' || !state.game.history.length || state.thinking || Backend.pending) return;
     if (state.mode === 'engine') {
-      try {
-        const res = await Backend.undo();
-        if (typeof res.undone === 'number') n = res.undone;
-      } catch (e) {
-        toast('Takeback failed: ' + e.message, 4000);
-        return;
-      }
+      try { applyRemoteState(await Backend.undo()); }
+      catch (err) { await reconnectPi({ force: true }); toast('Takeback failed: ' + err.message, 4500); }
+      return;
     }
-    for (let i = 0; i < n && g.history.length; i++) { g.undo(); state.snapshots.pop(); }
-    state.premove = null;
-    state.selected = null; state.legal = []; state.viewPly = null; state.pendingPromo = null;
-    el.promo.classList.add('hidden');
-    if (state.tc.base && g.history.length) { state.running = g.turn; state.lastTick = performance.now(); }
-    else state.running = null;
-    renderAll();
-    if (state.mode === 'computer' && g.turn !== state.playerColor) scheduleBot();
+    state.game.undo(); state.snapshots.pop();
+    state.premove = null; state.selected = null; state.legal = []; state.viewPly = null; state.pendingPromo = null;
+    el.promo.classList.add('hidden'); renderAll();
   }
 
   function setViewPly(n) {
@@ -1044,13 +1083,13 @@
     save();
     renderNewGamePanel();
   });
-  const startComputerGame = () => startGame(Backend.available ? 'engine' : 'computer');
+  const startComputerGame = () => startGame('engine');
   el.playBtn.addEventListener('click', startComputerGame);
   el.playBot.addEventListener('click', startComputerGame);
   el.playFriend.addEventListener('click', () => startGame('friend'));
 
   el.btnResign.addEventListener('click', () => {
-    if (state.status !== 'playing') return;
+    if (state.status !== 'playing' || state.mode === 'engine') return;
     if (state.game.history.length < 2) { resignOrAbort(); return; }
     el.confirmText.textContent = 'Are you sure you want to resign?';
     el.confirm.classList.remove('hidden');
@@ -1086,6 +1125,7 @@
     startGame(state.mode, nextColor);
   }
   function newGame() {
+    if (Backend.pending || state.thinking) return;
     state.premove = null;
     clearTimeout(state.botTimer);
     state.gameId++;
@@ -1152,6 +1192,22 @@
     }
   });
 
+  el.accessForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    el.accessSubmit.disabled = true; el.accessError.textContent = '';
+    try {
+      await Backend.request('api/login', { code: el.accessCode.value });
+      Backend.authenticated = true; el.accessCode.value = ''; el.access.classList.add('hidden');
+      await reconnectPi({ force: true });
+    } catch (err) { el.accessError.textContent = err.message; }
+    finally { el.accessSubmit.disabled = false; }
+  });
+  $('#access-local').addEventListener('click', () => startGame('friend'));
+  el.reconnect.addEventListener('click', () => {
+    if (!Backend.authenticated) showAccess(); else reconnectPi({ force: true });
+  });
+  $('#remote-newgame').addEventListener('click', newGame);
+
   // ----------------------------------------------------------------- boot
 
   restore();
@@ -1160,10 +1216,7 @@
   pushSnapshot(null);
   renderNewGamePanel();
   renderAll();
-  Backend.probe().then(() => {
-    if (state.status !== 'idle') return;
-    if (Backend.available) state.mode = 'engine';
-    renderNewGamePanel();
-    renderAll();
-  });
+  reconnectPi({ force: true });
+  setInterval(() => { if (!document.hidden) reconnectPi(); }, 5000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) reconnectPi(); });
 })();
