@@ -1,1 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" style="color-scheme:light only" width="45" height="45" viewBox="0 0 45 45"><path stroke="#000" stroke-linecap="round" stroke-width="1.5" d="M22.5 9a4 4 0 0 0-3.22 6.38 6.48 6.48 0 0 0-.87 10.65c-3 1.06-7.41 5.55-7.41 13.47h23c0-7.92-4.41-12.41-7.41-13.47a6.46 6.46 0 0 0-.87-10.65A4.01 4.01 0 0 0 22.5 9z"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <rect x="44" y="64" width="12" height="20" rx="3" fill="#17191f" stroke="#ffffff" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+  <polygon points="50,14 72.517,27 72.517,53 50,66 27.483,53 27.483,27" fill="#17191f" stroke="#ffffff" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+  <circle cx="50" cy="40" r="11" fill="none" stroke="#ffffff" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+  <line x1="30" y1="84" x2="70" y2="84" fill="none" stroke="#ffffff" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+  <rect x="22" y="88" width="56" height="7" rx="3.5" fill="#17191f" stroke="#ffffff" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>

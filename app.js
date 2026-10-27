@@ -1,4 +1,11 @@
-/* app.js — board UI, clocks, move list, game flow. Rules come from chess.js. */
+/* app.js — board UI, clocks, move list, game flow.
+ *
+ * Rules come from chess.js (client side, for instant hints and highlights).
+ * When the page is served by frontend/server.py, computer games go through the
+ * chess_game.py backend (python-chess + Stockfish) via the /api/* endpoints.
+ * Without a backend (plain static hosting) the computer falls back to a casual
+ * random mover so the UI still works.
+ */
 (() => {
   'use strict';
 
@@ -21,19 +28,64 @@
   ];
   const GROUP_ICON = { Bullet: '🚀', Blitz: '⚡', Rapid: '⏱', Casual: '☕' };
 
+  // ----------------------------------------------------------------- backend (chess_game.py via server.py)
+
+  const Backend = {
+    available: false,
+    engine: false,
+    engineError: null,
+    levels: [],
+    async probe() {
+      try {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 2000);
+        const r = await fetch('api/status', { signal: ctrl.signal, cache: 'no-store' });
+        clearTimeout(timer);
+        if (!r.ok) throw new Error('status ' + r.status);
+        const s = await r.json();
+        this.available = true;
+        this.engine = !!s.engine;
+        this.engineError = s.engineError || null;
+        this.levels = Array.isArray(s.levels) && s.levels.length ? s.levels : [];
+      } catch (e) {
+        this.available = false;
+      }
+      return this.available;
+    },
+    async call(path, body) {
+      const r = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body || {}),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        const err = new Error(data.error || ('Server error ' + r.status));
+        err.data = data;
+        throw err;
+      }
+      return data;
+    },
+    newGame(level) { return this.call('api/new', { level }); },
+    move(from, to, promotion) { return this.call('api/move', { from, to, promotion: promotion || null }); },
+    undo() { return this.call('api/undo', {}); },
+  };
+
   // ----------------------------------------------------------------- state
 
   const state = {
     game: new Chess(),
     status: 'idle',          // idle | playing | over
-    mode: 'computer',        // computer | friend
+    mode: 'computer',        // engine (backend Stockfish) | computer (local casual bot) | friend
     playerColor: 'w',
     colorPref: 'random',
+    level: 'beginner',
     tc: TIME_CONTROLS[6],
     clocks: { w: 0, b: 0 },
     running: null,
     lastTick: 0,
     orientation: 'w',
+    premove: null,
     selected: null,
     legal: [],
     viewPly: null,           // null = live position
@@ -41,18 +93,24 @@
     result: null,
     gameId: 0,
     botTimer: null,
+    thinking: false,
     pendingPromo: null,
     drag: null,
     sound: true,
+    pieceStyle: 'duen',
     hoverSq: null,
   };
 
   const el = {
     board: $('#board'), squares: $('#squares'), pieces: $('#pieces'), promo: $('#promo'), toast: $('#toast'),
+    ranks: $('#ranks'), files: $('#files'),
     top: $('#player-top'), bottom: $('#player-bottom'),
     panelNew: $('#panel-new'), panelGame: $('#panel-game'),
     tcButton: $('#tc-button'), tcLabel: $('#tc-label'), tcMenu: $('#tc-menu'),
-    playBtn: $('#play-btn'), playFriend: $('#play-friend'), playBot: $('#play-bot'), colorPick: $('#color-pick'),
+    levelRow: $('#level-row'), levelPick: $('#level-pick'), backendStatus: $('#backend-status'),
+    playBtn: $('#play-btn'), playFriend: $('#play-friend'), playBot: $('#play-bot'),
+    playBotTitle: $('#play-bot-title'), playBotSub: $('#play-bot-sub'),
+    colorRow: $('#color-row'), colorPick: $('#color-pick'),
     gameTitle: $('#game-title'), moves: $('#moves'),
     confirm: $('#confirm'), confirmText: $('#confirm-text'), confirmYes: $('#confirm-yes'), confirmNo: $('#confirm-no'),
     btnDraw: $('#btn-draw'), btnResign: $('#btn-resign'), resignLabel: $('#resign-label'), btnTakeback: $('#btn-takeback'),
@@ -112,7 +170,6 @@
           case 'start': this.tone(523, 0.1, 'sine', 0.2, 0); this.tone(659, 0.12, 'sine', 0.2, 0.09); break;
           case 'end': this.tone(523, 0.14, 'sine', 0.22, 0); this.tone(392, 0.14, 'sine', 0.22, 0.14); this.tone(330, 0.25, 'sine', 0.22, 0.28); break;
           case 'win': this.tone(523, 0.12, 'sine', 0.22, 0); this.tone(659, 0.12, 'sine', 0.22, 0.12); this.tone(784, 0.12, 'sine', 0.22, 0.24); this.tone(1047, 0.3, 'sine', 0.25, 0.36); break;
-          case 'tick': this.tone(1000, 0.03, 'square', 0.03, 0); break;
         }
       } catch (e) { /* ignore audio errors */ }
     },
@@ -144,13 +201,28 @@
     toast.t = setTimeout(() => el.toast.classList.add('hidden'), ms || 2200);
   }
 
+  function levelInfo(id) {
+    return Backend.levels.find((l) => l.id === id) || { id, label: id.charAt(0).toUpperCase() + id.slice(1), description: '' };
+  }
+
   function playerNames() {
-    if (state.mode === 'computer') {
-      const you = { name: 'You', cls: 'you', initial: 'Y' };
-      const bot = { name: 'Computer', cls: 'bot', initial: '🤖' };
+    if (state.mode === 'engine') {
+      const you = { name: 'You', cls: 'you', initial: 'Y', sub: '' };
+      const bot = { name: 'Stockfish', cls: 'bot', initial: '🤖', sub: levelInfo(state.level).label };
       return state.playerColor === 'w' ? { w: you, b: bot } : { w: bot, b: you };
     }
-    return { w: { name: 'White', cls: 'white', initial: '♔' }, b: { name: 'Black', cls: 'black', initial: '♚' } };
+    if (state.mode === 'computer') {
+      const you = { name: 'You', cls: 'you', initial: 'Y', sub: '' };
+      const bot = { name: 'Computer', cls: 'bot', initial: '🤖', sub: 'casual' };
+      return state.playerColor === 'w' ? { w: you, b: bot } : { w: bot, b: you };
+    }
+    return { w: { name: 'White', cls: 'white', initial: '♔', sub: '' }, b: { name: 'Black', cls: 'black', initial: '♚', sub: '' } };
+  }
+
+  function opponentLabel() {
+    if (state.mode === 'engine') return `vs Stockfish (${levelInfo(state.level).label})`;
+    if (state.mode === 'computer') return 'vs Computer';
+    return 'Pass & Play';
   }
 
   function tcTitle(tc) {
@@ -159,17 +231,50 @@
 
   function save() {
     try {
-      localStorage.setItem('chess.prefs', JSON.stringify({ tc: state.tc.id, color: state.colorPref, sound: state.sound }));
+      localStorage.setItem('duen.chess.prefs', JSON.stringify({ tc: state.tc.id, color: state.colorPref, sound: state.sound, level: state.level, pieceStyle: state.pieceStyle }));
     } catch (e) { /* ignore */ }
   }
   function restore() {
     try {
-      const p = JSON.parse(localStorage.getItem('chess.prefs') || '{}');
+      const p = JSON.parse(localStorage.getItem('duen.chess.prefs') || '{}');
       if (p.tc) state.tc = TIME_CONTROLS.find((t) => t.id === p.tc) || state.tc;
       if (p.color) state.colorPref = p.color;
+      if (p.level) state.level = p.level;
+      if (p.pieceStyle === 'regular') state.pieceStyle = 'regular';
       if (typeof p.sound === 'boolean') state.sound = p.sound;
     } catch (e) { /* ignore */ }
   }
+
+  function pieceAsset(piece) {
+    return `assets/${state.pieceStyle === 'regular' ? 'regular' : 'pieces'}/${piece}.svg`;
+  }
+
+  function applyPieceStyle() {
+    for (const color of ['w', 'b']) {
+      for (const type of ['K', 'Q', 'R', 'B', 'N', 'P']) {
+        document.documentElement.style.setProperty(`--piece-${color}${type}`, `url("${pieceAsset(color + type)}")`);
+      }
+    }
+    $$('.piece-style-options button').forEach((button) => {
+      button.setAttribute('aria-pressed', String(button.dataset.pieceStyle === state.pieceStyle));
+    });
+    $$('#color-pick img').forEach((image) => {
+      image.src = pieceAsset(image.closest('button').dataset.color + 'K');
+    });
+    renderPlayers();
+    if (state.pendingPromo) {
+      const { from, to, cands, opts } = state.pendingPromo;
+      showPromotion(from, to, cands, opts);
+    }
+  }
+
+  $$('.piece-style-options button').forEach((button) => {
+    button.addEventListener('click', () => {
+      state.pieceStyle = button.dataset.pieceStyle;
+      save();
+      applyPieceStyle();
+    });
+  });
 
   // ----------------------------------------------------------------- board rendering
 
@@ -180,6 +285,13 @@
       d.className = 'sq';
       el.squares.appendChild(d);
     }
+  }
+
+  function renderFrameLabels() {
+    const ranks = state.orientation === 'w' ? [8, 7, 6, 5, 4, 3, 2, 1] : [1, 2, 3, 4, 5, 6, 7, 8];
+    const files = state.orientation === 'w' ? 'abcdefgh' : 'hgfedcba';
+    el.ranks.innerHTML = ranks.map((r) => `<span>${r}</span>`).join('');
+    el.files.innerHTML = files.split('').map((f) => `<span>${f}</span>`).join('');
   }
 
   function currentSnapshot() {
@@ -200,7 +312,7 @@
   }
 
   /** Repaint squares and pieces. `anim` maps destination square -> origin square to slide from. */
-  function renderBoard(anim) {
+  function renderBoard(anim, botMove = false) {
     const snap = currentSnapshot();
     const live = state.viewPly === null;
     const cells = el.squares.children;
@@ -214,6 +326,7 @@
       const c = cells[i];
       let cls = 'sq ' + (((f + r) & 1) ? 'light' : 'dark');
       if (snap.lastMove && (snap.lastMove.from === sqi || snap.lastMove.to === sqi)) cls += ' last';
+      if (live && state.premove && [state.premove.from, state.premove.to].includes(sqi)) cls += ' premove';
       if (live && state.selected === sqi) cls += ' selected';
       if (snap.check && snap.kingSq === sqi) cls += ' check';
       if (legalTargets.has(sqi)) cls += snap.board[sqi] || isEpTarget(sqi) ? ' capture' : ' hint';
@@ -222,10 +335,6 @@
       if (canMove && p && colorOf(p) === state.game.turn) cls += ' own';
       c.className = cls;
       c.dataset.sq = sqi;
-      let html = '';
-      if (x === 0) html += `<span class="coord rank">${r + 1}</span>`;
-      if (y === 7) html += `<span class="coord file">${'abcdefgh'[f]}</span>`;
-      c.innerHTML = html;
     }
 
     el.pieces.innerHTML = '';
@@ -235,6 +344,7 @@
       if (!p) continue;
       const d = document.createElement('div');
       d.className = `piece ${colorOf(p)}${typeOf(p).toUpperCase()} noanim`;
+      if (botMove) d.classList.add('bot-move');
       d.dataset.sq = sqi;
       const from = anim && anim[sqi] !== undefined ? anim[sqi] : sqi;
       const [x, y] = toXY(from);
@@ -243,15 +353,15 @@
       if (from !== sqi) pending.push([d, sqi]);
     }
     if (pending.length) {
-      // force layout, then animate to destination
-      void el.pieces.offsetWidth;
+      void el.pieces.offsetWidth; // force layout, then animate to destination
       for (const [d, sqi] of pending) {
         d.classList.remove('noanim');
         const [x, y] = toXY(sqi);
         d.style.transform = `translate(${x * 100}%, ${y * 100}%)`;
       }
     }
-    el.board.classList.toggle('grab', canMove);
+    el.board.classList.toggle('grab', canMove || canPremove());
+    renderPremove();
   }
 
   function isEpTarget(sqi) {
@@ -271,14 +381,16 @@
       const av = $('.avatar', bar);
       av.className = 'avatar ' + n.cls;
       av.textContent = n.initial;
-      $('.player-name', bar).innerHTML = n.name + (state.mode === 'computer' && n.cls === 'bot' ? '<small>(casual)</small>' : '');
+      let name = n.name + (n.sub ? `<small>(${n.sub})</small>` : '');
+      if (state.thinking && n.cls === 'bot' && state.status === 'playing') name += '<span class="thinking">thinking…</span>';
+      $('.player-name', bar).innerHTML = name;
       const cap = $('.captured', bar);
       let html = '';
       const groups = {};
       for (const t of captured[color]) (groups[t] = groups[t] || []).push(t);
       for (const t of ['p', 'n', 'b', 'r', 'q']) {
         if (!groups[t]) continue;
-        html += '<span class="grp">' + groups[t].map(() => `<img src="assets/pieces/${opp(color)}${t.toUpperCase()}.svg" alt="">`).join('') + '</span>';
+        html += '<span class="grp">' + groups[t].map(() => `<img src="${pieceAsset(opp(color) + t.toUpperCase())}" alt="">`).join('') + '</span>';
       }
       const adv = color === 'w' ? balance : -balance;
       if (adv > 0) html += `<span class="adv">+${adv}</span>`;
@@ -307,7 +419,7 @@
       return;
     }
     let html = '';
-    const curPly = state.viewPly === null ? h.length : state.viewPly; // snapshot index == plies played
+    const curPly = state.viewPly === null ? h.length : state.viewPly;
     for (let i = 0; i < h.length; i += 2) {
       const w = h[i], b = h[i + 1];
       html += `<div class="mrow"><span class="num">${i / 2 + 1}.</span>` +
@@ -341,19 +453,20 @@
   function renderControls() {
     const playing = state.status === 'playing';
     const plies = state.game.history.length;
-    el.btnDraw.disabled = !playing;
+    el.btnDraw.disabled = !playing || state.thinking;
     el.btnResign.disabled = !playing;
     el.resignLabel.textContent = playing && plies < 2 ? 'Abort' : 'Resign';
-    el.btnTakeback.disabled = !playing || plies === 0;
+    el.btnTakeback.disabled = !playing || plies === 0 || state.thinking;
     const cur = state.viewPly === null ? plies : state.viewPly;
     el.navFirst.disabled = el.navPrev.disabled = cur === 0;
     el.navNext.disabled = el.navLast.disabled = cur >= plies;
     el.afterGame.classList.toggle('hidden', state.status !== 'over');
-    el.gameTitle.textContent = `${tcTitle(state.tc)} • ${state.mode === 'computer' ? 'vs Computer' : 'Pass & Play'}`;
+    el.gameTitle.textContent = `${tcTitle(state.tc)} • ${opponentLabel()}`;
   }
 
-  function renderAll(anim) {
-    renderBoard(anim);
+  function renderAll(anim, botMove = false) {
+    renderFrameLabels();
+    renderBoard(anim, botMove);
     renderPlayers();
     renderMoves();
     renderControls();
@@ -374,47 +487,136 @@
       g.items.map((tc) => `<button type="button" class="tc-opt${tc.id === state.tc.id ? ' on' : ''}" data-tc="${tc.id}">${tc.label}</button>`).join('') +
       '</div></div>').join('');
     el.soundToggle.classList.toggle('off', !state.sound);
+
+    // backend-driven options
+    if (Backend.available) {
+      if (!Backend.levels.some((l) => l.id === state.level)) state.level = (Backend.levels[0] || { id: 'beginner' }).id;
+      el.levelRow.classList.remove('hidden');
+      el.levelPick.innerHTML = Backend.levels.map((l) =>
+        `<button type="button" class="${l.id === state.level ? 'on' : ''}" data-level="${l.id}" title="${l.description || ''}">${l.label}<small>${l.description || ''}</small></button>`).join('');
+      el.colorRow.classList.add('hidden');
+      el.playBotTitle.textContent = 'Play Stockfish';
+      el.playBotSub.textContent = 'You play White · chess_game backend';
+      if (Backend.engine) {
+        el.backendStatus.textContent = 'Connected to the chess_game backend · Stockfish ready';
+        el.backendStatus.className = 'backend-status ok';
+      } else {
+        el.backendStatus.textContent = 'Backend connected, but Stockfish was not found: ' + (Backend.engineError || 'install it or set STOCKFISH_PATH');
+        el.backendStatus.className = 'backend-status warn';
+      }
+    } else {
+      el.levelRow.classList.add('hidden');
+      el.colorRow.classList.remove('hidden');
+      el.playBotTitle.textContent = 'Play Bots';
+      el.playBotSub.textContent = 'Casual game vs the computer';
+      el.backendStatus.textContent = 'No backend detected · casual bot (run frontend/server.py for Stockfish)';
+      el.backendStatus.className = 'backend-status';
+    }
   }
 
   // ----------------------------------------------------------------- game flow
 
-  function startGame(mode, colorPref) {
+  function resetGameState() {
+    state.premove = null;
     clearTimeout(state.botTimer);
     state.gameId++;
     state.game = new Chess();
-    state.mode = mode;
-    state.status = 'playing';
     state.result = null;
     state.selected = null;
     state.legal = [];
     state.viewPly = null;
     state.pendingPromo = null;
     state.drag = null;
+    state.thinking = false;
     state.snapshots = [];
     pushSnapshot(null);
-    const pref = colorPref || state.colorPref;
-    state.playerColor = pref === 'random' ? (Math.random() < 0.5 ? 'w' : 'b') : pref;
-    state.orientation = mode === 'computer' ? state.playerColor : 'w';
     state.clocks = { w: state.tc.base * 1000, b: state.tc.base * 1000 };
     state.running = null;
     el.promo.classList.add('hidden');
     el.confirm.classList.add('hidden');
     hideModal();
+  }
+
+  async function startGame(mode, colorPref) {
+    if (mode === 'engine' && !Backend.available) mode = 'computer';
+    resetGameState();
+    const id = state.gameId;
+    state.mode = mode;
+    state.status = 'playing';
+    const pref = colorPref || state.colorPref;
+    state.playerColor = mode === 'engine' ? 'w' : pref === 'random' ? (Math.random() < 0.5 ? 'w' : 'b') : pref;
+    state.orientation = mode === 'friend' ? 'w' : state.playerColor;
     el.panelNew.classList.add('hidden');
     el.panelGame.classList.remove('hidden');
     renderAll();
+
+    if (mode === 'engine') {
+      try {
+        await Backend.newGame(state.level);
+      } catch (e) {
+        if (id !== state.gameId) return;
+        toast('Backend error: ' + e.message + ' — playing the casual bot instead', 4000);
+        state.mode = 'computer';
+        renderAll();
+      }
+      if (id !== state.gameId) return;
+    }
     Sound.play('start');
-    if (mode === 'computer' && state.game.turn !== state.playerColor) scheduleBot();
+    if (state.mode === 'computer' && state.game.turn !== state.playerColor) scheduleBot();
+  }
+
+  function canPremove() {
+    return state.status === 'playing' && state.mode !== 'friend' &&
+      state.game.turn !== state.playerColor && !state.pendingPromo && state.viewPly === null;
+  }
+
+  function renderPremove() {
+    const overlay = $('#premove-arrow');
+    const move = state.viewPly === null ? state.premove : null;
+    overlay.innerHTML = '';
+    if (!move) return;
+    const [x1, y1] = toXY(move.from), [x2, y2] = toXY(move.to);
+    overlay.innerHTML = `<defs><marker id="premove-head" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="3" markerHeight="3" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#4cb0ff"/></marker></defs><line x1="${x1 + .5}" y1="${y1 + .5}" x2="${x2 + .5}" y2="${y2 + .5}" stroke="#4cb0ff" stroke-width=".17" stroke-linecap="round" opacity=".9" marker-end="url(#premove-head)"/>`;
+  }
+
+  function clearPremove() {
+    state.premove = null;
+    state.selected = null;
+    state.legal = [];
+    renderBoard();
+  }
+
+  function queuePremove(from, to) {
+    if (!canPremove() || from === to) return false;
+    const piece = state.game.board[from];
+    if (!piece || colorOf(piece) !== state.playerColor) return false;
+    state.premove = { from, to };
+    state.selected = null;
+    state.legal = [];
+    renderBoard();
+    toast('Premove queued · right-click or Esc to cancel');
+    return true;
+  }
+
+  function playPremove() {
+    if (!state.premove || !canInteract() || state.viewPly !== null) return;
+    const move = state.premove;
+    state.premove = null;
+    // Validate against the actual position after the opponent's reply.
+    if (!tryMove(move.from, move.to, { animate: true, source: 'human' })) {
+      renderBoard();
+      toast('Premove cancelled — no longer legal');
+    }
   }
 
   function canInteract() {
-    return state.status === 'playing' && !state.pendingPromo &&
+    return state.status === 'playing' && !state.pendingPromo && !state.thinking &&
       (state.mode === 'friend' || state.game.turn === state.playerColor);
   }
 
   function select(sqi) {
     state.selected = sqi;
-    state.legal = state.game.movesFrom(sqi);
+    state.legal = canPremove() ? [] : state.game.movesFrom(sqi);
     renderBoard();
   }
 
@@ -427,6 +629,7 @@
 
   /** Attempt a move from -> to. Returns true if the move was played or a promotion picker opened. */
   function tryMove(from, to, opts) {
+    if (canPremove()) return queuePremove(from, to);
     const cands = state.game.movesFrom(from).filter((m) => m.to === to);
     if (!cands.length) return false;
     if (cands[0].promo) {
@@ -437,12 +640,21 @@
     return true;
   }
 
-  function commitMove(m, opts) {
+  /**
+   * Play a move on the local board and update everything.
+   * `input` is a move object from chess.js or a UCI string; opts.source is
+   * 'human' | 'bot' | 'engine' (engine = already played on the backend).
+   */
+  function commitMove(input, opts) {
     opts = opts || {};
     const g = state.game;
     const mover = g.turn;
-    const rec = g.move(m);
-    if (!rec) return;
+    const rec = g.move(input);
+    if (!rec) return null;
+    const m = rec.move;
+    state.drag = null;
+    state.hoverSq = null;
+    el.board.classList.remove('dragging');
     pushSnapshot(rec);
 
     if (state.tc.base) {
@@ -465,37 +677,99 @@
       if (m.flags & FLAGS.CASTLE_K) anim[m.to - 1] = m.to + 1;
       if (m.flags & FLAGS.CASTLE_Q) anim[m.to + 1] = m.to - 2;
     }
-    renderAll(anim);
+    renderAll(anim, opts.source === 'engine' || opts.source === 'bot');
 
     const over = g.gameOver();
     if (over) {
       endGame(over.winner, over.reason);
-      return;
+      return rec;
     }
     Sound.play(rec.check ? 'check' : rec.captured ? 'capture' : (m.flags & (FLAGS.CASTLE_K | FLAGS.CASTLE_Q)) ? 'castle' : 'move');
-    if (state.mode === 'computer' && g.turn !== state.playerColor) scheduleBot();
+
+    if (g.turn !== state.playerColor) {
+      if (state.mode === 'computer') scheduleBot();
+      else if (state.mode === 'engine' && opts.source !== 'engine') requestEngineMove(rec);
+    }
+    return rec;
   }
 
-  /** The "computer": a casual random mover that likes captures. No search, no evaluation. */
+  // Run the engine and this presentation delay together so engine time is included.
+  const botThinkMilliseconds = () => 1000 + Math.random() * 2000;
+
+  /** Send the human move to chess_game.py and play Stockfish's reply. */
+  async function requestEngineMove(rec) {
+    const id = state.gameId;
+    state.thinking = true;
+    renderPlayers();
+    renderControls();
+    try {
+      const [res] = await Promise.all([
+        Backend.move(sqName(rec.move.from), sqName(rec.move.to), rec.move.promo || null),
+        new Promise((resolve) => setTimeout(resolve, botThinkMilliseconds())),
+      ]);
+      if (id !== state.gameId || state.status !== 'playing') return;
+      state.thinking = false;
+      if (res.computer && res.computer.uci) {
+        const played = commitMove(res.computer.uci, { animate: true, source: 'engine' });
+        if (!played) throw new Error('Stockfish played ' + res.computer.uci + ', which the board rejected');
+      } else {
+        renderPlayers();
+        renderControls();
+      }
+      if (res.fen && !sameBoard(res.fen, state.game.fen())) {
+        clearPremove();
+        console.warn('Board differs from backend', res.fen, state.game.fen());
+        toast('Board is out of sync with the backend — start a new game', 4000);
+      } else {
+        playPremove();
+      }
+    } catch (e) {
+      if (id !== state.gameId) return;
+      state.thinking = false;
+      renderPlayers();
+      renderControls();
+      clearPremove();
+      toast(e.message, 4500);
+    }
+  }
+
+  function sameBoard(fenA, fenB) {
+    const a = fenA.split(' '), b = fenB.split(' ');
+    return a[0] === b[0] && a[1] === b[1] && a[2] === b[2];
+  }
+
+  /** Offline "computer": a casual random mover that likes captures. No search, no evaluation. */
   function scheduleBot() {
     const id = state.gameId;
     clearTimeout(state.botTimer);
+    state.thinking = true;
+    renderPlayers();
+    renderControls();
     state.botTimer = setTimeout(() => {
       if (id !== state.gameId || state.status !== 'playing') return;
       const g = state.game;
       const moves = g.legalMoves();
-      if (!moves.length) return;
+      if (!moves.length) {
+        state.thinking = false;
+        renderPlayers();
+        renderControls();
+        return;
+      }
       const caps = moves.filter((m) => m.flags & FLAGS.CAPTURE);
       const pool = caps.length && Math.random() < 0.65 ? caps : moves;
       let m = pool[Math.floor(Math.random() * pool.length)];
       if (m.promo) m = pool.find((x) => x.from === m.from && x.to === m.to && x.promo === 'q') || m;
-      commitMove(m, { animate: true });
-    }, 450 + Math.random() * 800);
+      state.thinking = false;
+      commitMove(m, { animate: true, source: 'bot' });
+      playPremove();
+    }, botThinkMilliseconds());
   }
 
   function endGame(winner, reason) {
+    state.premove = null;
     state.status = 'over';
     state.running = null;
+    state.thinking = false;
     clearTimeout(state.botTimer);
     state.result = { winner, reason };
     state.selected = null;
@@ -505,7 +779,7 @@
     el.confirm.classList.add('hidden');
     renderAll();
     if (reason !== 'aborted') {
-      const youWon = state.mode === 'computer' && winner === state.playerColor;
+      const youWon = state.mode !== 'friend' && winner === state.playerColor;
       Sound.play(youWon ? 'win' : 'end');
       showModal();
     }
@@ -515,7 +789,7 @@
     const r = state.result;
     const names = playerNames();
     let title, cls = '';
-    if (state.mode === 'computer') {
+    if (state.mode !== 'friend') {
       if (r.winner === state.playerColor) title = 'You Won!';
       else if (r.winner) { title = 'You Lost'; cls = 'lose'; }
       else { title = 'Draw'; cls = 'draw'; }
@@ -538,7 +812,7 @@
   function resignOrAbort() {
     if (state.status !== 'playing') return;
     if (state.game.history.length < 2) { endGame(null, 'aborted'); toast('Game aborted'); return; }
-    const loser = state.mode === 'computer' ? state.playerColor : state.game.turn;
+    const loser = state.mode === 'friend' ? state.game.turn : state.playerColor;
     endGame(opp(loser), 'resignation');
   }
 
@@ -548,17 +822,27 @@
     const bal = state.game.materialBalance();
     const botAhead = state.playerColor === 'w' ? bal < 0 : bal > 0;
     if (!botAhead) endGame(null, 'agreement');
-    else toast('Computer declined the draw offer');
+    else toast((state.mode === 'engine' ? 'Stockfish' : 'Computer') + ' declined the draw offer');
   }
 
-  function takeback() {
-    if (state.status !== 'playing' || !state.game.history.length) return;
+  async function takeback() {
+    if (state.status !== 'playing' || !state.game.history.length || state.thinking) return;
     const g = state.game;
     clearTimeout(state.botTimer);
     state.gameId++;
     let n = 1;
-    if (state.mode === 'computer' && g.turn === state.playerColor && g.history.length >= 2) n = 2;
-    for (let i = 0; i < n; i++) { g.undo(); state.snapshots.pop(); }
+    if (state.mode !== 'friend' && g.turn === state.playerColor && g.history.length >= 2) n = 2;
+    if (state.mode === 'engine') {
+      try {
+        const res = await Backend.undo();
+        if (typeof res.undone === 'number') n = res.undone;
+      } catch (e) {
+        toast('Takeback failed: ' + e.message, 4000);
+        return;
+      }
+    }
+    for (let i = 0; i < n && g.history.length; i++) { g.undo(); state.snapshots.pop(); }
+    state.premove = null;
     state.selected = null; state.legal = []; state.viewPly = null; state.pendingPromo = null;
     el.promo.classList.add('hidden');
     if (state.tc.base && g.history.length) { state.running = g.turn; state.lastTick = performance.now(); }
@@ -568,6 +852,7 @@
   }
 
   function setViewPly(n) {
+    state.premove = null;
     const plies = state.game.history.length;
     n = Math.max(0, Math.min(plies, n));
     state.viewPly = n >= plies ? null : n;
@@ -580,6 +865,7 @@
 
   function flip() {
     state.orientation = opp(state.orientation);
+    renderFrameLabels();
     renderBoard();
     renderPlayers();
   }
@@ -613,7 +899,7 @@
     el.promo.className = 'promo' + (y === 7 ? ' bottom' : '');
     el.promo.style.left = `${x * 12.5}%`;
     el.promo.innerHTML = ['q', 'n', 'r', 'b'].map((t) =>
-      `<button type="button" data-promo="${t}" style="background-image:url('assets/pieces/${color}${t.toUpperCase()}.svg')" title="${t}"></button>`).join('') +
+      `<button type="button" data-promo="${t}" style="background-image:url('${pieceAsset(color + t.toUpperCase())}')" title="${t}"></button>`).join('') +
       '<button type="button" class="x" data-promo="cancel">×</button>';
     renderBoard();
   }
@@ -652,17 +938,19 @@
       return;
     }
     if (state.viewPly !== null) goLive();
-    if (!canInteract()) return;
+    if (!canInteract() && !canPremove()) return;
     const sqi = squareFromEvent(e);
     if (sqi < 0) return;
     const p = state.game.board[sqi];
 
-    if (state.selected !== null && state.legal.some((m) => m.to === sqi)) {
-      tryMove(state.selected, sqi, { animate: true });
+    if (state.selected !== null && (state.legal.some((m) => m.to === sqi) ||
+        (canPremove() && sqi !== state.selected && (!p || colorOf(p) !== state.playerColor)))) {
+      tryMove(state.selected, sqi, { animate: true, source: 'human' });
       return;
     }
-    if (p && colorOf(p) === state.game.turn) {
+    if (p && colorOf(p) === (canPremove() ? state.playerColor : state.game.turn)) {
       const wasSelected = state.selected === sqi;
+      state.premove = null;
       select(sqi);
       startDrag(e, sqi, wasSelected);
     } else {
@@ -715,14 +1003,15 @@
     el.board.classList.remove('dragging');
     try { el.board.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
     const target = cancelled ? -1 : squareFromEvent(e);
-    if (d.moved && target >= 0 && target !== d.sqi && state.legal.some((m) => m.to === target)) {
-      tryMove(d.sqi, target, { animate: false });
+    if (d.moved && target >= 0 && target !== d.sqi && (canPremove() || state.legal.some((m) => m.to === target))) {
+      tryMove(d.sqi, target, { animate: false, source: 'human' });
     } else if (!d.moved && d.wasSelected) {
       deselect();
     } else {
       renderBoard(); // snap back
     }
   }
+  el.board.addEventListener('contextmenu', (e) => { e.preventDefault(); clearPremove(); });
   el.board.addEventListener('pointerup', (e) => endDrag(e, false));
   el.board.addEventListener('pointercancel', (e) => endDrag(e, true));
 
@@ -741,6 +1030,13 @@
     el.tcMenu.classList.add('hidden');
     el.tcButton.setAttribute('aria-expanded', 'false');
   });
+  el.levelPick.addEventListener('click', (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    state.level = b.dataset.level;
+    save();
+    renderNewGamePanel();
+  });
   el.colorPick.addEventListener('click', (e) => {
     const b = e.target.closest('button');
     if (!b) return;
@@ -748,8 +1044,9 @@
     save();
     renderNewGamePanel();
   });
-  el.playBtn.addEventListener('click', () => startGame('computer'));
-  el.playBot.addEventListener('click', () => startGame('computer'));
+  const startComputerGame = () => startGame(Backend.available ? 'engine' : 'computer');
+  el.playBtn.addEventListener('click', startComputerGame);
+  el.playBot.addEventListener('click', startComputerGame);
   el.playFriend.addEventListener('click', () => startGame('friend'));
 
   el.btnResign.addEventListener('click', () => {
@@ -789,11 +1086,14 @@
     startGame(state.mode, nextColor);
   }
   function newGame() {
+    state.premove = null;
     clearTimeout(state.botTimer);
     state.gameId++;
     state.status = 'idle';
     state.running = null;
+    state.thinking = false;
     hideModal();
+    renderBoard();
     el.panelGame.classList.add('hidden');
     el.panelNew.classList.remove('hidden');
     renderNewGamePanel();
@@ -816,7 +1116,7 @@
     const names = playerNames();
     const r = state.result;
     copy(state.game.pgn({
-      Event: 'Casual game', Site: location.host || 'local', Date: new Date().toISOString().slice(0, 10).replace(/-/g, '.'),
+      Event: 'DUEN chess', Site: location.host || 'local', Date: new Date().toISOString().slice(0, 10).replace(/-/g, '.'),
       White: names.w.name, Black: names.b.name,
       Result: r ? (r.winner === 'w' ? '1-0' : r.winner === 'b' ? '0-1' : '1/2-1/2') : '*',
       TimeControl: state.tc.base ? `${state.tc.base}+${state.tc.inc}` : '-',
@@ -841,7 +1141,7 @@
       case 'ArrowUp': case 'Home': setViewPly(0); e.preventDefault(); break;
       case 'ArrowDown': case 'End': setViewPly(plies); e.preventDefault(); break;
       case 'f': case 'F': flip(); break;
-      case 'Escape': hideModal(); el.confirm.classList.add('hidden'); if (state.pendingPromo) { state.pendingPromo = null; el.promo.classList.add('hidden'); deselect(); renderBoard(); } break;
+      case 'Escape': clearPremove(); hideModal(); el.confirm.classList.add('hidden'); if (state.pendingPromo) { state.pendingPromo = null; el.promo.classList.add('hidden'); deselect(); renderBoard(); } break;
     }
   });
 
@@ -855,8 +1155,15 @@
   // ----------------------------------------------------------------- boot
 
   restore();
+  applyPieceStyle();
   buildSquares();
   pushSnapshot(null);
   renderNewGamePanel();
   renderAll();
+  Backend.probe().then(() => {
+    if (state.status !== 'idle') return;
+    if (Backend.available) state.mode = 'engine';
+    renderNewGamePanel();
+    renderAll();
+  });
 })();
