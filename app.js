@@ -675,6 +675,12 @@
     }
   }
 
+  async function resumeRemoteConnection({ force = false } = {}) {
+    await reconnectPi({ force });
+    // Reconnect inside the grace period without waiting for the next 20s pulse.
+    await heartbeatPi();
+  }
+
   async function releaseBoard() {
     if (!Backend.isController || Backend.pending || Backend.releasing || state.thinking) return;
     const epoch = ++Backend.epoch, gameId = Backend.gameId;
@@ -1333,10 +1339,10 @@
   pushSnapshot(null);
   renderNewGamePanel();
   renderAll();
-  reconnectPi({ force: true });
+  resumeRemoteConnection({ force: true });
   setInterval(() => { if (Backend.pageActive && !document.hidden) reconnectPi(); }, 5000);
   setInterval(heartbeatPi, 20000);
   window.addEventListener('pagehide', () => { Backend.pageActive = false; Backend.epoch++; });
-  window.addEventListener('pageshow', () => { Backend.pageActive = true; reconnectPi(); });
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) reconnectPi(); });
+  window.addEventListener('pageshow', () => { Backend.pageActive = true; resumeRemoteConnection(); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) resumeRemoteConnection(); });
 })();

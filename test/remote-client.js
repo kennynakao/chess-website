@@ -19,7 +19,7 @@ source=source.slice(0,source.indexOf('  // -------------------------------------
  const renderOwnership = renderConnection;
  renderBoard = renderAll = renderPlayers = renderControls = renderNewGamePanel = renderConnection = hideModal = toast = () => {};
  Sound.play = () => {};
- globalThis.app={Backend,state,applyRemoteState,startGame,requestEngineMove,reconnectPi,canInteract,canPremove,queuePremove,commitMove,takeback,heartbeatPi,releaseBoard,continueSavedGame,renderOwnership};
+ globalThis.app={Backend,state,applyRemoteState,startGame,requestEngineMove,reconnectPi,canInteract,canPremove,queuePremove,commitMove,takeback,heartbeatPi,releaseBoard,continueSavedGame,renderOwnership,resumeRemoteConnection};
 })();`;
 vm.runInContext(source,context);
 const a=context.app,b=a.Backend,s=a.state;
@@ -154,4 +154,11 @@ function response(body,status=200) { return {ok:status<400,status,json:async()=>
  b.suppressRenewal();b.accept(snapshot(['e2e4','e7e5','g1f3','b8c6'],20,owned));assert.equal(b.renewalEnabled,false);
  sessionStorage.setItem=originalStorageSet;sessionStorage.getItem=originalStorageGet;
  console.log('PASS disabled browser storage retains in-memory release intent');
+ sessionStorage.removeItem('duen.chess.releasedGame');b.suppressedGameId=null;b.renewalEnabled=true;
+ a.applyRemoteState(snapshot([],21,{...owned,leaseExpiresAt:Date.now()/1000+5}));
+ const resumedRequests=[];handler=async(path)=>{resumedRequests.push(path);return response(snapshot([],21,owned));};
+ await a.resumeRemoteConnection();assert.deepEqual(resumedRequests,['/api/status','/api/heartbeat']);
+ b.suppressRenewal();resumedRequests.length=0;
+ await a.resumeRemoteConnection();assert.deepEqual(resumedRequests,['/api/status']);
+ console.log('PASS returning near lease expiry renews promptly after status without undoing release intent');
 })().catch(err=>{console.error(err);process.exitCode=1;});
