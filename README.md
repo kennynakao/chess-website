@@ -13,7 +13,9 @@ The current integration runs chess logic and Stockfish; it does not drive motors
 
 ## Repository layout
 
-- Root HTML, CSS, JavaScript, assets: the existing chess interface.
+- `index.html`, `landing.js`, `landing.css`: the animated landing page.
+- `play.html`, `app.js`, `chess.js`, `style.css`: the chess interface.
+- `assets/vendor/`: the locally served Three.js runtime and its license.
 - `api/[action].js`: Vercel login/session handling and server-only Pi proxy.
 - `backend/remote_server.py`: loopback-only authenticated Pi API and SQLite state.
 - `backend/chess_game.py`: shared rules and Stockfish integration.
@@ -95,5 +97,9 @@ python -m unittest discover -s test -p 'test_remote_server.py'
 ```
 
 Vercel builds `public/` with `scripts/build-web.sh` and deploys only the static
-interface and the `api/` function. The experimental landing-page design is not
-part of this connection change.
+landing page, chess interface, and the `api/` function. The landing page links
+to `/play.html`; the existing Pi connection remains on that game page.
+
+The landing scene uses a dark-purple backdrop, a floating wooden pawn, and a
+scroll-driven opening move. It pauses rendering when settled or out of view,
+respects reduced motion, and caps its drawing buffer on large displays.

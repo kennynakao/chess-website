@@ -11,7 +11,7 @@ const context = { Chess, document, console, setTimeout: () => 1, clearTimeout() 
  crypto: { randomUUID: () => 'test-request-'+(++uuid) }, fetch: (...args) => handler(...args) };
 vm.createContext(context);
 let source = fs.readFileSync(require.resolve('../app.js'),'utf8');
-const html = fs.readFileSync(require.resolve('../index.html'),'utf8');
+const html = fs.readFileSync(require.resolve('../play.html'),'utf8');
 for (const match of source.matchAll(/\$\('#([a-z][a-z0-9-]*)'\)/g)) assert(html.includes('id="'+match[1]+'"'), 'missing element '+match[1]);
 source=source.slice(0,source.indexOf('  // ----------------------------------------------------------------- boot'))+`
  renderBoard = renderAll = renderPlayers = renderControls = renderNewGamePanel = renderConnection = hideModal = toast = () => {};
