@@ -1,4 +1,4 @@
-/* concept.html only: the 3D "How a move travels" walkthrough, in the DUEN colors. */
+/* The 3D "How a move travels" walkthrough on the front page. */
 .how-story { --signal: #f4c040; height: 800vh; height: 800svh; position: relative; z-index: 5; }
 .how-stage {
   height: 100vh; height: 100svh; position: sticky; top: 0; overflow: hidden; isolation: isolate;

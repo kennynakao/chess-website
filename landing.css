@@ -1,23 +1,5 @@
-/* Clean white theme: system type, hairlines, one blue accent. */
+/* The DUEN colors: plum, gold and cream, with system type and no web fonts. */
 :root {
-  color-scheme: light;
-  --bg: #ffffff;
-  --bg-alt: #f5f5f7;
-  --ink: #1d1d1f;
-  --muted: #6e6e73;
-  --faint: #86868b;
-  --line: #d2d2d7;
-  --accent: #0071e3;
-  --accent-hover: #0077ed;
-  --link: #0066cc;
-  --on-accent: #ffffff;
-  --nav-bg: rgba(255, 255, 255, .94);
-  --nav-line: rgba(0, 0, 0, .08);
-  --scrim: 255, 255, 255;
-  --font: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", "Segoe UI", Roboto, Arial, sans-serif;
-}
-/* concept.html: the same page in the DUEN colors. */
-html[data-theme="duen"] {
   color-scheme: dark;
   --bg: #241440;
   --bg-alt: #1c0f33;
@@ -32,8 +14,8 @@ html[data-theme="duen"] {
   --nav-bg: rgba(36, 20, 64, .94);
   --nav-line: rgba(244, 192, 64, .22);
   --scrim: 36, 20, 64;
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", "Segoe UI", Roboto, Arial, sans-serif;
 }
-html[data-theme="duen"] .stage { background: radial-gradient(ellipse 85% 70% at 50% 58%, #50307c 0%, #33205a 48%, #241440 100%); }
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
 body {
@@ -66,9 +48,9 @@ nav span { margin-left: 3px; }
 
 /* ------------------------------------------------------------------ scroll stage */
 .journey { height: 460vh; height: 460svh; }
-.stage { position: sticky; top: 0; height: 100vh; height: 100svh; overflow: hidden; background: var(--bg); }
+.stage { position: sticky; top: 0; height: 100vh; height: 100svh; overflow: hidden; background: radial-gradient(ellipse 85% 70% at 50% 58%, #50307c 0%, #33205a 48%, #241440 100%); }
 #scene { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; }
-/* Keeps the headline area clean and melts the scene into the page. */
+/* Melts the scene into the purple at the top and bottom edges. */
 .scrim {
   position: absolute; inset: 0; z-index: 2; pointer-events: none;
   background:
@@ -93,7 +75,6 @@ nav span { margin-left: 3px; }
   margin: 16px auto 0; max-width: 740px;
   font-size: clamp(17px, 1.55vw, 21px); line-height: 1.38; letter-spacing: -.012em; color: var(--muted);
 }
-.descent > p:first-child { margin: 0 0 10px; font-size: clamp(15px, 1.3vw, 17px); font-weight: 600; letter-spacing: -.01em; color: var(--faint); }
 .cta {
   display: inline-block; margin-top: 22px; padding: 12px 24px; border-radius: 980px;
   background: var(--accent); color: var(--on-accent); font-size: 17px; font-weight: 500; letter-spacing: -.01em;
@@ -101,19 +82,6 @@ nav span { margin-left: 3px; }
 }
 .cta:hover { background: var(--accent-hover); }
 #scene-fallback { position: absolute; bottom: 72px; left: 50%; z-index: 5; width: min(320px, 88vw); margin: 0; transform: translateX(-50%); text-align: center; font-size: 14px; color: var(--muted); }
-
-/* ------------------------------------------------------------------ how a move travels */
-.how { position: relative; z-index: 5; padding: clamp(72px, 11vh, 130px) 22px; background: var(--bg); }
-.how-head { max-width: 660px; margin: 0 auto clamp(36px, 6vh, 56px); text-align: center; }
-.how-head h2 { margin: 0; font-size: clamp(36px, 4.4vw, 60px); font-weight: 600; letter-spacing: -.022em; line-height: 1.05; }
-.how-head p { margin: 16px 0 0; font-size: clamp(17px, 1.55vw, 21px); line-height: 1.38; letter-spacing: -.012em; color: var(--muted); }
-.flow { list-style: none; margin: 0 auto; padding: 0; max-width: 1040px; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; counter-reset: step; }
-.flow li { padding: 22px 18px 24px; background: var(--bg-alt); border-radius: 18px; counter-increment: step; }
-.flow li::before { content: counter(step); display: grid; place-items: center; width: 28px; height: 28px; margin-bottom: 14px; border-radius: 50%; background: var(--accent); color: var(--on-accent); font-size: 14px; font-weight: 600; }
-.flow h3 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: -.012em; }
-.flow p { margin: 6px 0 0; font-size: 14px; line-height: 1.4; color: var(--muted); }
-.flow .next { background: transparent; border: 1.5px dashed var(--faint); }
-.flow .next::before { background: transparent; box-shadow: inset 0 0 0 1.5px var(--accent); color: var(--accent); }
 
 /* ------------------------------------------------------------------ details */
 .details { position: relative; z-index: 5; padding: clamp(80px, 12vh, 140px) 22px 28px; background: var(--bg-alt); text-align: center; }
@@ -131,17 +99,19 @@ footer {
   border-top: 1px solid var(--line); font-size: 12px; color: var(--faint);
 }
 
-@media (max-width: 900px) {
-  .flow { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
-@media (max-width: 520px) {
-  .flow { grid-template-columns: minmax(0, 1fr); }
-}
 @media (max-width: 700px) {
   .wordmark span, nav > a:not(.play-link) { display: none; }
   .chapter { top: 76px; }
   .chapter h1 { font-size: 11.5vw; }
   .chapter h2 { font-size: 10vw; }
+}
+/* Short laptop windows: keep the copy above the pieces. */
+@media (max-height: 720px) and (min-width: 701px) {
+  .chapter { top: 66px; }
+  .chapter h1 { font-size: 48px; }
+  .chapter h2 { font-size: 36px; }
+  .intro-copy, .story-copy, .arrival p { margin-top: 8px; font-size: 15px; }
+  .cta { margin-top: 12px; padding: 8px 18px; font-size: 15px; }
 }
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }

@@ -6,19 +6,15 @@ const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
 const clamp=(x)=>Math.max(0,Math.min(1,x));
 const smooth=(a,b,x)=>{let t=clamp((x-a)/(b-a));return t*t*(3-2*t)};
 const lerp=THREE.MathUtils.lerp;
-// Colors and finishes per page: index.html is white, concept.html is DUEN purple.
-const THEMES={
- white:{fog:0xffffff,sky:0xffffff,ground:0xd8d8de,whiteSet:{color:0xeeeef2,roughness:.32,metalness:.28,envMapIntensity:1.1},blackSet:{color:0x2b2b2e,roughness:.36,metalness:.4,envMapIntensity:1},slab:0xe6e6ea,light:0xf7f7f9,dark:0xa0a0a8},
- duen:{fog:0x33205a,sky:0xfff1d6,ground:0x33205a,whiteSet:{color:0xf4c040,roughness:.3,metalness:.65,envMapIntensity:1.2},blackSet:{color:0x120a1e,roughness:.3,metalness:.5,envMapIntensity:1.3},slab:0x241440,light:0xfcecb8,dark:0x442074},
-};
-const theme=THEMES[document.documentElement.dataset.theme]||THEMES.white;
+// The DUEN colors: gold and near-black pieces on a cream and purple board.
+const theme={accent:0xf4c040,fog:0x33205a,sky:0xfff1d6,ground:0x33205a,whiteSet:{color:0xf4c040,roughness:.3,metalness:.65,envMapIntensity:1.2},blackSet:{color:0x120a1e,roughness:.3,metalness:.5,envMapIntensity:1.3},slab:0x241440,light:0xfcecb8,dark:0x442074};
 try {
 const renderer=new THREE.WebGLRenderer({canvas,alpha:true,antialias:true,powerPreference:'high-performance'});
 // Keep large displays from multiplying the scene into millions of extra pixels.
 renderer.shadowMap.enabled=true;renderer.shadowMap.type=THREE.PCFSoftShadowMap;
 renderer.shadowMap.autoUpdate=false;
 renderer.toneMapping=THREE.NeutralToneMapping;renderer.toneMappingExposure=1;
-const scene=new THREE.Scene();scene.fog=new THREE.FogExp2(theme.fog,.035);
+const scene=new THREE.Scene();scene.fog=new THREE.FogExp2(theme.fog,.014);
 const camera=new THREE.PerspectiveCamera(34,1,.1,100);
 const pmrem=new THREE.PMREMGenerator(renderer);scene.environment=pmrem.fromScene(new RoomEnvironment(),.03).texture;scene.environmentIntensity=.62;pmrem.dispose();
 scene.add(new THREE.HemisphereLight(theme.sky,theme.ground,.25));
@@ -70,12 +66,15 @@ for(const [material,geometries] of batches){const mesh=new THREE.Mesh(mergeGeome
 const boardMaterials=[...batches.keys()];boardMaterials.forEach(m=>m.transparent=true);
 board.add(new THREE.Mesh(mergeGeometries(contactQuads),contact));
 const pawnContact=new THREE.Mesh(contactQuad(0,0),contact.clone());scene.add(pawnContact);
-// Only the shadow is drawn, so the board sits straight on the white page with no horizon line.
+// The move itself, in the page's accent color: the two squares the pawn travels between.
+const moveMark=new THREE.Mesh(mergeGeometries([.5,2.5].map(z=>new THREE.PlaneGeometry(1,1).rotateX(-Math.PI/2).translate(.5,.026,z))),new THREE.MeshBasicMaterial({color:theme.accent,transparent:true,depthWrite:false,toneMapped:false,fog:false,opacity:0}));moveMark.renderOrder=-1;scene.add(moveMark);
+// Only the shadow is drawn, so the board sits straight on the page with no horizon line.
 const floor=new THREE.Mesh(new THREE.PlaneGeometry(100,100),new THREE.ShadowMaterial({opacity:0}));floor.rotation.x=-Math.PI/2;floor.position.y=-.37;floor.receiveShadow=true;scene.add(floor);
 const intro=document.querySelector('.intro'),descent=document.querySelector('.descent'),arrival=document.querySelector('.arrival');
 const journey=document.querySelector('.journey');
 let progress=0,target=0,journeyStart=0,scrollRange=1,stageHeight=1;
-let frameHandle=0,previous=0,spinSeconds=0,lastPose=-1,lastUI=-1;
+const SPIN_AT_REST=.35,SPIN_SCROLLING=4; // Radians per second; 4 is one full turn in about 1.6 seconds.
+let frameHandle=0,previous=0,spinAngle=0,spinRate=reduced?0:SPIN_AT_REST,lastPose=-1,lastUI=-1;
 let dirty=true,ready=false,inView=true;
 // Slow device: trade canvas resolution for smooth scrolling. Text stays sharp.
 let quality=1,slowFrames=0;
@@ -120,25 +119,35 @@ function frame(now){
  if(Math.abs(progress-target)<.00001)progress=target;
  const p=progress,mobile=innerWidth<700;
  const drop=smooth(.3,.65,p),advance=smooth(.7,.94,p),reveal=smooth(.22,.43,p);
- const spinning=!reduced&&drop<1;
- const changed=dirty||Math.abs(p-lastPose)>.000001;
  const settling=progress!==target;
+ // The spin runs on the clock, never the scroll distance: one fixed speed while scrolling, however fast,
+ // and a slow one at rest. It eases between them, and to a stop once the pawn lands.
+ if(!reduced){spinRate=lerp(spinRate,drop<1?(settling?SPIN_SCROLLING:SPIN_AT_REST):0,1-Math.exp(-5*dt));if(drop>=1&&spinRate<.005)spinRate=0;}
+ const spinning=spinRate>0;
+ const changed=dirty||Math.abs(p-lastPose)>.000001;
  if(!changed&&!spinning){pause('idle');return;}
- if(spinning)spinSeconds+=dt;
+ spinAngle+=spinRate*dt;
  board.visible=reveal>.005;floor.visible=board.visible;
  for(const material of boardMaterials){
    const transparent=reveal<1;
    if(material.transparent!==transparent){material.transparent=transparent;material.needsUpdate=true;}
    material.opacity=reveal;
  }
- contact.opacity=reveal;floor.material.opacity=.16*reveal;
+ contact.opacity=reveal;floor.material.opacity=.22*reveal;
+ moveMark.material.opacity=.9*smooth(.68,.82,p);moveMark.visible=moveMark.material.opacity>0;
  pawn.position.set(.5,lerp(5,.035,drop),2.5-advance*2);
- pawnContact.visible=board.visible;pawnContact.position.set(.5,0,pawn.position.z);pawnContact.material.opacity=reveal*smooth(.45,.65,p);
- pawn.rotation.set(lerp(.24,0,drop),reduced?0:(spinSeconds*.35+p*5)*(1-drop),lerp(-.28,0,drop));
+ // A soft shadow grounds the floating pawn, then becomes its contact shadow on the board.
+ const hover=1-smooth(.26,.36,p);
+ pawnContact.position.set(.5,hover>0?pawn.position.y-.28:0,pawn.position.z);pawnContact.scale.setScalar(hover>0?1.9:1);
+ pawnContact.material.opacity=Math.max(hover*.3,reveal*smooth(.45,.65,p));
+ pawn.rotation.set(lerp(.24,0,drop),spinAngle,lerp(-.28,0,drop));
  pawn.scale.setScalar(lerp(1.9,1,drop));
  const chase=smooth(.3,.68,p);
- camera.position.set(lerp(.5,1.2,chase),lerp(5.7,3.7,chase),lerp(mobile?12:10,15.5,chase)-advance*2);
- camera.lookAt(.5,lerp(7,1.75,chase),lerp(.5,1.2,chase)-advance*2);
+ // High enough to see the pawn's square over White's back rank, with the whole board below the headline.
+ // Off to one side, so the pawn shows between the white king and bishop rather than behind the king.
+ const [height,distance,aim]=mobile?[9,17,2.1]:[8.5,19,2.46];
+ camera.position.set(lerp(.5,2.6,chase),lerp(5.7,height,chase),lerp(mobile?12:10,distance,chase)-advance*2);
+ camera.lookAt(.5,lerp(6.75,aim,chase),lerp(.5,1.5,chase)-advance*2);
  if(dirty||Math.abs(p-lastUI)>.00001){
    setChapter(intro,1-smooth(.2,.3,p));
    setChapter(descent,smooth(.4,.48,p)*(1-smooth(.6,.68,p)));
@@ -154,6 +163,7 @@ function frame(now){
  if(debug){
   canvas.dataset.renderState=spinning?'spinning':'scrolling';
   canvas.dataset.progress=p.toFixed(4);
+  canvas.dataset.spinAngle=spinAngle.toFixed(4);
   canvas.dataset.frames=String(renderedFrames);
   canvas.dataset.shadowUpdates=String(shadowUpdates);
   canvas.dataset.drawCalls=String(renderer.info.render.calls);

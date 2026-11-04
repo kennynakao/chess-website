@@ -3,9 +3,10 @@
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DUEN — Automatic Chess Board</title>
-<meta name="description" content="A physical game. A new way to move. Explore the DUEN automatic chess board.">
-<meta name="theme-color" content="#ffffff">
-<link rel="stylesheet" href="landing.css?v=white-1">
+<meta name="description" content="A chess board that moves its own pieces, designed at UC Davis.">
+<meta name="theme-color" content="#241440">
+<link rel="stylesheet" href="landing.css?v=duen-3">
+<link rel="stylesheet" href="how-it-works.css?v=1">
 <script type="importmap">{"imports":{"three":"./assets/vendor/three.module.js","three/addons/":"./assets/vendor/addons/"}}</script>
 </head>
 <body>
@@ -15,16 +16,61 @@
 <div class="stage">
 <canvas id="scene" aria-label="A chess pawn falls onto e2 and advances to e4 while the camera follows"></canvas>
 <div class="scrim"></div>
-<div class="chapter intro"><p class="opening-note">The next move is yours.</p><h1>Automatic<br>Chess Board<span class="period">.</span></h1><p class="intro-copy">A familiar game. An entirely new kind of movement.<br>From the first thought to the first move, the board becomes part of the experience.</p></div>
-<div class="chapter descent"><p>Choose your move. Watch it become real.</p><h2>From your screen.<br>To the real world.</h2><p class="story-copy">Every square holds a possibility.<br>Every move brings the game to life.</p></div>
-<div class="chapter arrival"><h2>Let the board<br>make its move.</h2><p>The king’s pawn advances. Two squares. Endless possibilities.<br>Your opening move is only the beginning.</p><a class="cta" href="play.html">Enter the game</a></div>
+<div class="chapter intro"><p class="opening-note">The next move is yours.</p><h1>Automatic<br>Chess Board<span class="period">.</span></h1><p class="intro-copy">A chess board that moves its own pieces.</p></div>
+<div class="chapter descent"><h2>From your screen.<br>To the real world.</h2><p class="story-copy">Move a piece on your phone, and it moves on the real board.</p></div>
+<div class="chapter arrival"><h2>Let the board<br>make its move.</h2><p>Pawn to e4. Now try it against Stockfish.</p><a class="cta" href="play.html">Enter the game</a></div>
 
 
 <p id="scene-fallback" hidden>The interactive scene is unavailable on this device. You can still explore and play.</p>
 </div>
 </section>
-<section class="how" id="how"><div class="how-head"><h2>How a move travels.</h2><p>Every move is checked and saved on the Raspberry Pi before anything else happens.</p></div><ol class="flow"><li><h3>Your browser</h3><p>You make a move from anywhere, on any device.</p></li><li><h3>Secure relay</h3><p>A signed session and a private tunnel carry it to the board.</p></li><li><h3>Raspberry Pi</h3><p>The Pi validates the move and saves the game.</p></li><li><h3>Stockfish</h3><p>The engine replies at the level you picked.</p></li><li class="next"><h3>The board moves</h3><p>The Pi plans every piece’s path. Connecting the motors is the next stage of the build.</p></li></ol></section>
-<section class="details" id="details"><div class="details-top"><p>Designed at UC Davis</p><h2>Chess, with<br>a life of its own.</h2></div><div class="details-bottom"><p>A board built around the moment a piece moves. Explore the interface, play a game, or follow the engineering behind the project.</p><div class="links"><a href="play.html">Play a game <span aria-hidden="true">›</span></a><a href="https://github.com/kennynakao/chess-website" target="_blank" rel="noopener">Explore the frontend <span aria-hidden="true">›</span></a></div></div><footer><span>DUEN / Automatic Chess Board</span><span>Built to move.</span></footer></section>
+<section class="how-story" id="how-it-works" aria-labelledby="how-heading">
+  <div class="how-stage">
+    <canvas id="how-scene" aria-hidden="true"></canvas>
+    <p class="how-loading" role="status">Preparing the 3D walkthrough…</p>
+    <div class="how-topline"><h2 id="how-heading">How a move travels</h2><a class="how-skip" href="#details">Skip the walkthrough <span aria-hidden="true">↓</span></a></div>
+    <article class="how-step" data-step="0">
+      <p class="how-step-number">01 / 05 · Your browser</p>
+      <h3>Make your move.</h3>
+      <p>Open the board from anywhere and choose a move. Your browser sends a small message to the website.</p>
+      <div class="how-example">e2 → e4 <small>Your opening move</small></div>
+    </article>
+    <article class="how-step" data-step="1">
+      <p class="how-step-number">02 / 05 · The secure connection</p>
+      <h3>Across the internet.</h3>
+      <p>Vercel checks your access, then forwards the move through the Pi’s protected Tailscale connection.</p>
+      <div class="how-example">Website → Raspberry Pi</div>
+    </article>
+    <article class="how-step" data-step="2">
+      <p class="how-step-number">03 / 05 · Raspberry Pi</p>
+      <h3>The Pi thinks ahead.</h3>
+      <p>The Pi checks the rules, asks Stockfish for a reply, and saves both moves together. This is where the game lives.</p>
+      <div class="how-example">Rules checked. Reply saved.</div>
+    </article>
+    <article class="how-step" data-step="3">
+      <p class="how-step-number">04 / 05 · The physical board</p>
+      <h3>From logic to movement.</h3>
+      <p>The Pi will send the move to the board’s mechanical components, which guide the real piece to its square. The position then travels back to your computer.</p>
+      <div class="how-example">Pi → mechanics → piece <small>Planned integration</small></div>
+    </article>
+    <article class="how-step" data-step="4">
+      <p class="how-step-number">05 / 05 · Back to your browser</p>
+      <h3>Your next move awaits.</h3>
+      <p>The confirmed position returns through the same relay. Your board updates with both moves, ready for what comes next.</p>
+      <div class="how-example">e7 → e5 <small>An example reply</small></div>
+    </article>
+    <div class="how-overview"><h3>One move. There and back.</h3><p>The website and the Pi stay in sync over the internet. Wi-Fi, a shared laptop connection, or cellular can keep the Pi online.</p></div>
+    <span class="how-node-label" data-node="0" aria-hidden="true">Your browser</span>
+    <span class="how-node-label" data-node="1" aria-hidden="true">Secure relay</span>
+    <span class="how-node-label" data-node="2" aria-hidden="true">Raspberry Pi</span>
+    <span class="how-node-label" data-node="3" aria-hidden="true">Physical board</span>
+    <span class="how-node-label" data-node="4" aria-hidden="true">Your computer</span>
+    <div class="how-bottom"><p>Remote chess logic and replies are connected.<br>Physical motor control is the next step.</p></div>
+    <p class="how-fallback-message">The same connection, explained without animation.</p>
+  </div>
+</section>
+<section class="details" id="details"><div class="details-top"><p>Designed at UC Davis</p><h2>Chess, with<br>a life of its own.</h2></div><div class="details-bottom"><p>We’re building this at UC Davis. You can play it now or read the code.</p><div class="links"><a href="play.html">Play a game <span aria-hidden="true">›</span></a><a href="https://github.com/kennynakao/chess-website" target="_blank" rel="noopener">Explore the frontend <span aria-hidden="true">›</span></a></div></div><footer><span>DUEN / Automatic Chess Board</span><span>Built to move.</span></footer><details class="model-credits"><summary>3D model credits</summary><p><a href="https://sketchfab.com/3d-models/macbook-pro-13-inch-2020-efab224280fd4c3993c808107f7c0b38" target="_blank" rel="noopener">MacBook Pro 13 inch 2020 by timblewee</a> · <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>. Adapted to an open pose with a DUEN screen.</p><p><a href="https://polyhaven.com/a/chess_set" target="_blank" rel="noopener">Chess Set by Riley Queen / Poly Haven</a> · CC0. Textures optimized for the web.</p><p>Illustrative single-board computer by <a href="https://www.innerscene.com/tools/library/3d-parts/85-x-56-mm-single-board-computer-9b02b167" target="_blank" rel="noopener">Innerscene</a> and compute rack by <a href="https://3dassets.dev/packs/data-centre-infiltration-kit" target="_blank" rel="noopener">3DAssets.dev</a> · CC0. Models illustrate the system; they are not exact replicas of DUEN hardware.</p></details></section>
 </main>
-<script type="module" src="landing.js?v=white-1"></script>
+<script type="module" src="landing.js?v=duen-4"></script>
+<script type="module" src="how-it-works.js?v=1"></script>
 </body></html>

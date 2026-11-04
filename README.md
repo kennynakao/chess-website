@@ -15,11 +15,10 @@ program is connected yet, so nothing physically moves. See "Board movement".
 ## Repository layout
 
 - `index.html`, `landing.js`, `landing.css`: the animated landing page.
-- `concept.html`, `concept.css`, `how-it-works.js`: the landing page in the DUEN colors with
-  the 3D "How a move travels" walkthrough. Not linked from the site.
+- `how-it-works.js`, `how-it-works.css`: the 3D "How a move travels" walkthrough on that page.
 - `play.html`, `app.js`, `chess.js`, `style.css`: the chess interface.
 - `assets/models/`: the chess piece models (STL) shown in the landing scene, and the
-  credited walkthrough models (laptop, Pi, relay, chess set) used by `concept.html`.
+  credited walkthrough models (laptop, Pi, relay, chess set).
 - `assets/vendor/`: the locally served Three.js runtime and its license.
 - `api/[action].js`: Vercel login/session handling and server-only Pi proxy.
 - `backend/remote_server.py`: loopback-only authenticated Pi API and SQLite state.
@@ -135,6 +134,6 @@ Vercel builds `public/` with `scripts/build-web.sh` and deploys only the static
 landing page, chess interface, and the `api/` function. The landing page links
 to `/play.html`; the existing Pi connection remains on that game page.
 
-The landing scene uses a white backdrop, a floating silver pawn, and a
+The landing scene uses a DUEN purple backdrop, a floating gold pawn, and a
 scroll-driven opening move. It pauses rendering when settled or out of view,
 respects reduced motion, and caps its drawing buffer on large displays.
