@@ -16,7 +16,7 @@ for (const match of source.matchAll(/\$\('#([a-z][a-z0-9-]*)'\)/g)) assert(html.
 source=source.slice(0,source.indexOf('  // ----------------------------------------------------------------- boot'))+`
  renderBoard = renderAll = renderPlayers = renderControls = renderNewGamePanel = renderConnection = hideModal = toast = () => {};
  Sound.play = (kind) => { app.lastSound = kind; };
- globalThis.app={Backend,state,applyRemoteState,startGame,requestEngineMove,reconnectPi,canInteract,canPremove,queuePremove,commitMove,takeback};
+ globalThis.app={Backend,state,applyRemoteState,startGame,requestEngineMove,reconnectPi,canInteract,canPremove,queuePremove,commitMove,takeback,motionText,scanBoard};
 })();`;
 vm.runInContext(source,context);
 const a=context.app,b=a.Backend,s=a.state;
@@ -106,4 +106,20 @@ function response(body,status=200) { return {ok:status<400,status,json:async()=>
  a.applyRemoteState(snapshot(['e2e4','e7e5'],20));
  assert(a.canInteract());
  console.log('PASS a Pi without movement support still plays normally');
+ a.applyRemoteState(snapshot(['e2e4','e7e5'],21,{motion:{mode:'manual',state:'waiting',current:'e7e5',pending:1,error:null,camera:true,instructions:['Move the black pawn from e7 to e5.'],mismatch:{missing:['e5'],extra:['e7'],uncertain:[]}}}));
+ assert(a.canInteract());
+ assert.equal(a.motionText(),'On the board: Move the black pawn from e7 to e5. (+1 queued) The camera sees no piece on e5 and an extra piece on e7.');
+ console.log('PASS waiting on a person shows what to do and what the camera sees');
+ a.applyRemoteState(snapshot(['e2e4','e7e5'],22,{motion:{mode:'manual',state:'idle',camera:true,instructions:[]}}));
+ let sent=[];
+ handler=async(path,opts)=>{sent.push([path,JSON.parse(opts.body)]);return path==='/api/board-scan'?response({ok:true,status:'matched',candidates:[{from:'g1',to:'f3',promotion:null,uci:'g1f3',san:'Nf3'}]}):response(snapshot(['e2e4','e7e5','g1f3','b8c6'],23));};
+ await a.scanBoard();
+ assert.equal(sent[0][0],'/api/board-scan');assert.equal(sent[1][0],'/api/move');assert.equal(sent[1][1].fromBoard,true);assert.equal(sent[1][1].from,'g1');assert.equal(s.game.history.length,4);
+ console.log('PASS a move read off the board is played without moving the piece again');
+ a.applyRemoteState(snapshot(['e2e4','e7e5','g1f3','b8c6'],24,{motion:{mode:'manual',state:'idle',camera:true,instructions:[]}}));
+ sent=[];
+ handler=async(path,opts)=>{sent.push(path);return response({ok:true,status:'ambiguous',candidates:[{san:'a8=Q'},{san:'a8=N'}]});};
+ await a.scanBoard();
+ assert.deepEqual(sent,['/api/board-scan']);assert.equal(s.game.history.length,4);
+ console.log('PASS an ambiguous photo never plays a move by itself');
 })().catch(err=>{console.error(err);process.exitCode=1;});

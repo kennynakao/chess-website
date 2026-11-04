@@ -2,8 +2,11 @@
 
 Nothing here knows about motors. A job is plain JSON, handed to a driver:
 
-    {"id": 7, "label": "e7e5", "steps": [
+    {"id": 7, "label": "e7e5", "expect": ["a1", "a2", ...], "steps": [
         {"op": "carry", "piece": "p", "from": "e7", "to": "e5", "path": [[4, 6], [4, 4]]}]}
+
+"expect" lists every board square that should be occupied once the job is done, which
+is what a camera can check.
 
 Paths are in square units: a1 is (0, 0) and h8 is (7, 7). To perform a carry, go to
 the first point, engage the piece, follow the points in order, then release it.
@@ -13,6 +16,13 @@ x = -1 and -2, Black's at x = 8 and 9, with y from 0 to 7. Those slots are named
 "w:0" to "w:15" and "b:0" to "b:15".
 
 A step with op "note" moves nothing; it is a message for whoever is watching.
+
+Three ways to perform a job, chosen by driver_from_env():
+
+    CHESS_MOTION_COMMAND=...   a motor program moves the pieces
+    CHESS_BOARD_MODE=manual    a person moves them, as in the pi-only branch of
+                               Self-Moving-Chess-Board-Code, and confirms on the website
+    neither                    nothing moves; the jobs are only logged
 """
 
 from __future__ import annotations
@@ -119,12 +129,17 @@ def _plan_ply(layout: Layout, board: chess.Board, move: chess.Move) -> list[dict
     return steps
 
 
-def _replay(history: list[str]) -> tuple[Layout, list[tuple[str, list[dict]]]]:
+def _on_board(layout: Layout) -> list[str]:
+    return sorted(name for name in layout.pieces if ":" not in name)
+
+
+def _replay(history: list[str]) -> tuple[Layout, list[dict]]:
     layout, board, plies = Layout(), chess.Board(), []
     for uci in history:
         move = chess.Move.from_uci(uci)
-        plies.append((uci, _plan_ply(layout, board, move)))
+        steps = _plan_ply(layout, board, move)
         board.push(move)
+        plies.append({"label": uci, "steps": steps, "expect": _on_board(layout)})
     return layout, plies
 
 
@@ -148,18 +163,41 @@ def plan_transition(before: list[str], after: list[str], new_game: bool = False)
     layout, plies = _replay(before)
     if new_game:
         steps = _plan_reset(layout)
-        return [{"label": "reset", "steps": steps}] if steps else []
+        return [{"label": "reset", "steps": steps, "expect": _on_board(Layout())}] if steps else []
     if after[:len(before)] == before:
-        _, forward = _replay(after)
-        return [{"label": uci, "steps": steps} for uci, steps in forward[len(before):]]
+        return _replay(after)[1][len(before):]
     if before[:len(after)] == after:
-        return [{"label": "undo " + uci, "steps": _reversed_steps(steps)} for uci, steps in reversed(plies[len(after):])]
+        start = _on_board(Layout())
+        return [{"label": "undo " + plies[i]["label"], "steps": _reversed_steps(plies[i]["steps"]),
+                 "expect": plies[i - 1]["expect"] if i else start}
+                for i in range(len(before) - 1, len(after) - 1, -1)]
     raise ValueError("These game histories are not connected by moves or takebacks.")
 
 
+def describe_job(job: dict) -> list[str]:
+    """What a person has to do to perform a job by hand."""
+    if job["label"] == "reset":
+        return ["Set up the standard starting position."]
+    lines = []
+    for step in job["steps"]:
+        if step["op"] != "carry":
+            lines.append(step["message"])
+            continue
+        symbol = step["piece"]
+        piece = f"{'white' if symbol.isupper() else 'black'} {chess.piece_name(chess.PIECE_SYMBOLS.index(symbol.lower()))}"
+        if ":" in step["to"]:
+            lines.append(f"Remove the {piece} from {step['from']}.")
+        elif ":" in step["from"]:
+            lines.append(f"Put the {piece} on {step['to']}.")
+        else:
+            lines.append(f"Move the {piece} from {step['from']} to {step['to']}.")
+    return lines
+
+
 class SimulatedDriver:
-    """The default when no motors are connected: records the signals and moves nothing."""
+    """The default when nothing is connected: records the signals and moves nothing."""
     name = "simulated"
+    moves_pieces, needs_person = False, False
 
     def execute(self, job: dict) -> None:
         logging.info("MOTION simulated job=%s label=%s steps=%s", job["id"], job["label"], json.dumps(job["steps"]))
@@ -172,6 +210,7 @@ class CommandDriver:
     done, anything else stops the queue until someone checks the board.
     """
     name = "command"
+    moves_pieces, needs_person = True, False
 
     def __init__(self, command: str, timeout: float = COMMAND_TIMEOUT_SECONDS) -> None:
         self.args, self.timeout = shlex.split(command), timeout
@@ -181,6 +220,17 @@ class CommandDriver:
         subprocess.run(self.args, input=json.dumps(job), text=True, timeout=self.timeout, check=True)
 
 
+class ManualDriver:
+    """No motors: the queue waits for a person to move the pieces and confirm on the website."""
+    name = "manual"
+    moves_pieces, needs_person = True, True
+
+    def execute(self, job: dict) -> None:
+        logging.info("MOTION waiting for a person job=%s: %s", job["id"], " ".join(describe_job(job)))
+
+
 def driver_from_env():
     command = os.environ.get("CHESS_MOTION_COMMAND", "").strip()
-    return CommandDriver(command) if command else SimulatedDriver()
+    if command:
+        return CommandDriver(command)
+    return ManualDriver() if os.environ.get("CHESS_BOARD_MODE", "").strip() == "manual" else SimulatedDriver()

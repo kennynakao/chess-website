@@ -155,7 +155,7 @@
     modalSub: $('#modal-sub'), modalScore: $('#modal-score'), modalNameW: $('#modal-name-w'), modalNameB: $('#modal-name-b'),
     modalAvW: $('#modal-av-w'), modalAvB: $('#modal-av-b'), modalRematch: $('#modal-rematch'), modalNew: $('#modal-new'),
     soundToggle: $('#sound-toggle'),
-    connection: $('#connection-status'), reconnect: $('#reconnect-pi'), motionResolve: $('#motion-resolve'),
+    connection: $('#connection-status'), reconnect: $('#reconnect-pi'), motionResolve: $('#motion-resolve'), boardConfirm: $('#board-confirm'), boardScan: $('#board-scan'),
     access: $('#access-overlay'), accessForm: $('#access-form'), accessCode: $('#access-code'), accessError: $('#access-error'), accessSubmit: $('#access-submit'),
   };
 
@@ -519,7 +519,11 @@
       Backend.canControl ? 'Connected to Raspberry Pi · Stockfish ready' : 'Watching the Pi · another player has control';
     el.connection.textContent = Backend.available && motionText() ? `${message} · ${motionText()}` : message;
     el.reconnect.textContent = Backend.authenticated ? 'Reconnect' : 'Unlock';
-    el.motionResolve.classList.toggle('hidden', !(boardFaulted() && Backend.canControl));
+    const motion = Backend.motion || {};
+    const waiting = motion.state === 'waiting';
+    el.motionResolve.classList.toggle('hidden', !((boardFaulted() || waiting && motion.mismatch) && Backend.canControl));
+    el.boardConfirm.classList.toggle('hidden', !(waiting && Backend.canControl));
+    el.boardScan.classList.toggle('hidden', !(motion.camera && motion.state === 'idle' && state.mode === 'engine' && canInteract()));
   }
 
   const boardFaulted = () => !!Backend.motion && Backend.motion.state === 'fault';
@@ -529,8 +533,45 @@
     const motion = Backend.motion;
     if (!motion) return '';
     if (motion.state === 'fault') return 'Board stopped: set the pieces to match the screen, then confirm';
+    if (motion.state === 'waiting') {
+      const queued = motion.pending ? ` (+${motion.pending} queued)` : '';
+      return [`On the board: ${(motion.instructions || []).join(' ')}${queued}`, boardProblemText(motion.mismatch)].filter(Boolean).join(' ');
+    }
     if (motion.state === 'moving') return `Board moving ${motion.current}${motion.pending ? ` (+${motion.pending} queued)` : ''}`;
-    return motion.mode === 'simulated' ? 'Motors not connected' : 'Board ready';
+    if (motion.mode === 'simulated') return 'Motors not connected';
+    return motion.mode === 'manual' ? 'Moving pieces by hand' : 'Board ready';
+  }
+
+  /** What the camera saw wrong, in plain words. */
+  function boardProblemText(problem) {
+    if (!problem) return '';
+    if (problem.error) return problem.error;
+    if ((problem.uncertain || []).length) return `The camera can't tell about ${problem.uncertain.join(', ')}. Try again.`;
+    const parts = [];
+    if ((problem.missing || []).length) parts.push(`no piece on ${problem.missing.join(', ')}`);
+    if ((problem.extra || []).length) parts.push(`an extra piece on ${problem.extra.join(', ')}`);
+    return `The camera sees ${parts.join(' and ')}.`;
+  }
+
+  async function confirmBoard(override = false) {
+    try { await Backend.request('api/board-confirm', override ? { override: true } : {}); await reconnectPi({ force: true }); }
+    catch (err) { toast(err.message, 4500); }
+  }
+
+  /** Photograph the board and, if the photo shows exactly one legal move, play it. */
+  async function scanBoard() {
+    try {
+      const scan = await Backend.request('api/board-scan', {}, 25000);
+      if (scan.status === 'matched') {
+        const { from, to, promotion } = scan.candidates[0];
+        applyRemoteState(await Backend.call('api/move', { from, to, promotion, fromBoard: true }));
+        Sound.play('move');
+        return;
+      }
+      if (scan.status === 'ambiguous') toast(`The camera can't tell between ${scan.candidates.map((c) => c.san).join(', ')}. Play it on screen.`, 6000);
+      else if (scan.status === 'unchanged') toast('No move found on the board yet.');
+      else toast(boardProblemText(scan) || 'That is not a legal move on this board.', 5000);
+    } catch (err) { toast(err.message, 4500); }
   }
 
   function renderNewGamePanel() {
@@ -1228,9 +1269,12 @@
   });
   $('#remote-newgame').addEventListener('click', newGame);
   el.motionResolve.addEventListener('click', async () => {
+    if (!boardFaulted()) { await confirmBoard(true); return; }
     try { await Backend.request('api/motion-resolve', {}); await reconnectPi({ force: true }); }
     catch (err) { toast(err.message, 4500); }
   });
+  el.boardConfirm.addEventListener('click', () => confirmBoard());
+  el.boardScan.addEventListener('click', scanBoard);
 
   // ----------------------------------------------------------------- boot
 

@@ -24,13 +24,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import chess
-from backend.board_motion import SimulatedDriver, driver_from_env, plan_transition
+from backend.board_camera import camera_from_env, compare, scan_result
+from backend.board_motion import SimulatedDriver, describe_job, driver_from_env, plan_transition
 from backend.chess_game import ChessGame, DIFFICULTIES, PromotionRequired, StockfishPlayer
 
 MAX_BODY = 4096
 SESSION_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
 REQUEST_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
-ROUTES = {"/api/new", "/api/move", "/api/undo", "/api/motion-resolve"}
+ROUTES = {"/api/new", "/api/move", "/api/undo", "/api/motion-resolve", "/api/board-confirm", "/api/board-scan"}
 
 
 class ApiError(Exception):
@@ -42,7 +43,7 @@ class ApiError(Exception):
 class GameService:
     """Serialize changes; commit game and deduplication record atomically."""
     def __init__(self, database: str | Path, engine_factory=StockfishPlayer,
-                 clock=time.time, lease_seconds=3600, motion_driver=None):
+                 clock=time.time, lease_seconds=3600, motion_driver=None, camera=None):
         self.lock = threading.RLock()
         self.clock, self.lease_seconds = clock, lease_seconds
         self.engine_factory = engine_factory
@@ -57,7 +58,7 @@ class GameService:
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, response TEXT NOT NULL)")
-        self.db.execute("CREATE TABLE IF NOT EXISTS motion_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL, steps TEXT NOT NULL, status TEXT NOT NULL, error TEXT)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS motion_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL, steps TEXT NOT NULL, expect TEXT NOT NULL, status TEXT NOT NULL, error TEXT)")
         row = self.db.execute("SELECT value FROM state WHERE id=1").fetchone()
         self.record = json.loads(row[0]) if row else {
             "gameId": str(uuid.uuid4()), "revision": 0, "started": False,
@@ -69,11 +70,18 @@ class GameService:
                 self.db.execute("INSERT INTO state VALUES(1,?)", (json.dumps(self.record),))
         self._connect_engine()
         self.motion_driver = motion_driver or SimulatedDriver()
+        self.camera = camera
+        self.camera_lock = threading.Lock()
         self.motion_ready = threading.Condition(self.lock)
         self.closing = False
+        # What the person at the board has said, and what the camera last saw wrong.
+        self.board_confirmed = self.board_override = False
+        self.board_mismatch = None
         # A job cut off by a restart may have left a piece anywhere: never assume it finished.
         with self.db:
             self.db.execute("UPDATE motion_jobs SET status='failed', error='The Pi restarted while this move was running.' WHERE status='running'")
+            # A person can simply be asked again.
+            self.db.execute("UPDATE motion_jobs SET status='pending' WHERE status='waiting'")
         self.motion_thread = threading.Thread(target=self._run_motion, name="board-motion", daemon=True)
         self.motion_thread.start()
 
@@ -144,15 +152,19 @@ class GameService:
         }
 
     def _motion_status(self):
-        rows = self.db.execute("SELECT label, status, error FROM motion_jobs ORDER BY id").fetchall()
+        rows = self.db.execute("SELECT label, status, error, steps FROM motion_jobs ORDER BY id").fetchall()
         failed = next((row for row in rows if row[1] == "failed"), None)
+        waiting = next((row for row in rows if row[1] == "waiting"), None)
         running = next((row for row in rows if row[1] == "running"), None)
         return {
             "mode": self.motion_driver.name,
-            "state": "fault" if failed else "moving" if rows else "idle",
-            "current": (failed or running or (rows[0] if rows else (None,)))[0],
+            "camera": self.camera is not None,
+            "state": "fault" if failed else "waiting" if waiting else "moving" if rows else "idle",
+            "current": (failed or waiting or running or (rows[0] if rows else (None,)))[0],
             "pending": sum(row[1] == "pending" for row in rows),
             "error": failed[2] if failed else None,
+            "instructions": describe_job({"label": waiting[0], "steps": json.loads(waiting[3])}) if waiting else [],
+            "mismatch": self.board_mismatch if waiting else None,
         }
 
     def _run_motion(self):
@@ -163,12 +175,21 @@ class GameService:
                     self.motion_ready.wait()
                 if self.closing:
                     return
+                self.board_confirmed = self.board_override = False
+                self.board_mismatch = None
                 with self.db:
-                    self.db.execute("UPDATE motion_jobs SET status='running' WHERE id=?", (job["id"],))
+                    self.db.execute("UPDATE motion_jobs SET status=? WHERE id=?",
+                                    ("waiting" if self.motion_driver.needs_person else "running", job["id"]))
             logging.info("MOTION start job=%s label=%s driver=%s", job["id"], job["label"], self.motion_driver.name)
             error = None
             try:
                 self.motion_driver.execute(job)
+                if self.motion_driver.needs_person:
+                    if not self._wait_for_person(job):
+                        return
+                elif self.motion_driver.moves_pieces and (problem := self._check_board(job)):
+                    error = "The camera does not see the board the game expects."
+                    logging.warning("MOTION camera disagrees job=%s label=%s: %s", job["id"], job["label"], problem)
             except Exception as exc:
                 error = "The board could not finish this move."
                 logging.exception("MOTION failed job=%s label=%s", job["id"], job["label"])
@@ -181,12 +202,41 @@ class GameService:
                     else:
                         self.db.execute("DELETE FROM motion_jobs WHERE id=?", (job["id"],))
 
+    def _observe(self):
+        with self.camera_lock:
+            return self.camera.observe()
+
+    def _check_board(self, job):
+        return compare(job["expect"], self._observe()) if self.camera else None
+
+    def _wait_for_person(self, job):
+        """Hold the job until someone confirms and, if there is a camera, it agrees. False when closing."""
+        while True:
+            with self.motion_ready:
+                while not self.closing and not self.board_confirmed:
+                    self.motion_ready.wait()
+                if self.closing:
+                    return False
+                override, self.board_confirmed, self.board_override = self.board_override, False, False
+            if override:
+                return True
+            # Like a retaken photo in pi_game.py: a bad look never fails the job, it just asks again.
+            try:
+                problem = self._check_board(job)
+            except Exception:
+                logging.exception("CAMERA failed during job=%s", job["id"])
+                problem = {"error": "The camera could not take a photo."}
+            with self.lock:
+                self.board_mismatch = problem
+            if problem is None:
+                return True
+
     def _next_motion_job(self):
         # A failure halts everything behind it: later steps assume the earlier ones happened.
         if self.db.execute("SELECT 1 FROM motion_jobs WHERE status='failed'").fetchone():
             return None
-        row = self.db.execute("SELECT id, label, steps FROM motion_jobs WHERE status='pending' ORDER BY id").fetchone()
-        return {"id": row[0], "label": row[1], "steps": json.loads(row[2])} if row else None
+        row = self.db.execute("SELECT id, label, steps, expect FROM motion_jobs WHERE status='pending' ORDER BY id").fetchone()
+        return {"id": row[0], "label": row[1], "steps": json.loads(row[2]), "expect": json.loads(row[3])} if row else None
 
     def resolve_motion(self, session):
         """Someone checked the board and it matches the screen, so the queue restarts from here."""
@@ -201,6 +251,37 @@ class GameService:
             self.motion_ready.notify()
             return self._snapshot(session)
 
+    def confirm_board(self, session, override=False):
+        """The person at the board says they are done. With override, the camera is not consulted."""
+        with self.motion_ready:
+            if self._owned(session):
+                raise ApiError(409, "Another player is controlling the board.", "board_busy", state=self._snapshot(session))
+            self.board_confirmed, self.board_override = True, override
+            self.motion_ready.notify()
+            return self._snapshot(session)
+
+    def scan_board(self, session):
+        """Photograph the board and report which legal moves it could be showing. Commits nothing."""
+        if self.camera is None:
+            raise ApiError(409, "No camera is connected to the board.", "no_camera")
+        with self.lock:
+            if self._owned(session):
+                raise ApiError(409, "Another player is controlling the board.", "board_busy", state=self._snapshot(session))
+            if self._motion_status()["state"] != "idle":
+                raise ApiError(409, "Finish the moves on the board first.", "board_moving", state=self._snapshot(session))
+            if not self.game.started or self.game.board.turn != chess.WHITE or self.game.board.is_game_over(claim_draw=True):
+                raise ApiError(409, "It is not your turn.", "not_your_turn")
+            board, revision = self.game.board.copy(), self.record["revision"]
+        try:
+            observation = self._observe()
+        except Exception as exc:
+            logging.exception("CAMERA failed during a scan")
+            raise ApiError(503, "The camera could not take a photo.", "camera_failed") from exc
+        with self.lock:
+            if self.record["revision"] != revision:
+                raise ApiError(409, "The game changed. Reload its current state.", "stale_state", state=self._snapshot(session))
+        return {"ok": True, "revision": revision, **scan_result(board, observation)}
+
     def status(self, session):
         with self.lock:
             self._connect_engine(throttled=True)
@@ -213,6 +294,10 @@ class GameService:
             raise ApiError(404, "Unknown API route.", "not_found")
         if route == "/api/motion-resolve":
             return self.resolve_motion(session)
+        if route == "/api/board-confirm":
+            return self.confirm_board(session, body.get("override") is True)
+        if route == "/api/board-scan":
+            return self.scan_board(session)
         request_id = body.get("requestId")
         if not isinstance(request_id, str) or not REQUEST_PATTERN.fullmatch(request_id):
             raise ApiError(400, "A valid requestId is required.", "invalid_request")
@@ -290,11 +375,15 @@ class GameService:
                           level=candidate.level, uciMoves=[m.uci() for m in candidate.board.move_stack],
                           owner=session, leaseExpiresAt=self.clock() + self.lease_seconds)
             jobs = plan_transition(self.record["uciMoves"], record["uciMoves"], new_game=route == "/api/new")
+            if route == "/api/move" and body.get("fromBoard") is True:
+                # The camera read this move off the board, so the piece is already there.
+                jobs = jobs[1:]
             # The game and the signals it owes the board commit together, or not at all.
             with self.db:
                 self.db.execute("UPDATE state SET value=? WHERE id=1", (json.dumps(record),))
                 for job in jobs:
-                    self.db.execute("INSERT INTO motion_jobs (label, steps, status) VALUES (?,?,'pending')", (job["label"], json.dumps(job["steps"])))
+                    self.db.execute("INSERT INTO motion_jobs (label, steps, expect, status) VALUES (?,?,?,'pending')",
+                                    (job["label"], json.dumps(job["steps"]), json.dumps(job["expect"])))
                 response = {**self._snapshot(session, record, candidate), **extra, "requestId": request_id}
                 self.db.execute("INSERT INTO requests VALUES(?,?,?)", (request_id, fingerprint, json.dumps(response)))
             self.record, self.game = record, candidate
@@ -400,9 +489,9 @@ def main():
     path = Path(os.environ.get("CHESS_STATE_PATH", "~/.local/share/duen-chess/state.sqlite3")).expanduser().resolve()
     if path == REPO_ROOT or REPO_ROOT in path.parents:
         raise SystemExit("CHESS_STATE_PATH must be outside the source repository")
-    service = GameService(path, motion_driver=driver_from_env())
+    service = GameService(path, motion_driver=driver_from_env(), camera=camera_from_env())
     server = create_server(service, token, port=args.port)
-    logging.info("Pi API ready at http://127.0.0.1:%s; device=chessboard engine=%s motion=%s", args.port, service.player is not None, service.motion_driver.name)
+    logging.info("Pi API ready at http://127.0.0.1:%s; device=chessboard engine=%s motion=%s camera=%s", args.port, service.player is not None, service.motion_driver.name, service.camera is not None)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

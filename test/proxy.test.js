@@ -180,6 +180,18 @@ test('the board fault confirmation reaches the Pi for a signed-in player only', 
   assert.equal(new URL(calls[0][0]).pathname, '/api/motion-resolve');
 });
 
+test('board confirmation and scanning reach the Pi for a signed-in player only', async () => {
+  for (const action of ['board-confirm', 'board-scan']) {
+    calls.length = 0;
+    assert.equal((await request(action)).status, 401);
+    assert.equal(calls.length, 0);
+    const cookie = await login();
+    mockReply(200, { ok: true });
+    assert.equal((await request(action, { headers: { cookie } })).status, 200);
+    assert.equal(new URL(calls[0][0]).pathname, '/api/' + action);
+  }
+});
+
 test('unsupported routes and methods cannot be relayed', async () => {
   assert.equal((await request('arbitrary')).status, 404);
   assert.equal((await request('move', { method: 'GET' })).status, 405);
