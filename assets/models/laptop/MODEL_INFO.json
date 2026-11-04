@@ -1,0 +1,27 @@
+{
+  "file": "macbook-open.glb",
+  "byteLength": 3645964,
+  "sha256": "12be80bedfa5abe6094b77ab570d1c936d932ea3b8b369f4d009e678897b1285",
+  "triangles": 77065,
+  "primitives": 20,
+  "min": [
+    -0.15199999999999997,
+    1.734723475976807e-18,
+    -0.16531857110352235
+  ],
+  "max": [
+    0.152,
+    0.2110007498416032,
+    0.10612175733832467
+  ],
+  "size": [
+    0.30399999999999994,
+    0.2110007498416032,
+    0.271440328441847
+  ],
+  "orientation": "Y-up; keyboard extends toward+Z; open screen faces toward+Z and slightly upward",
+  "screenMesh": "Object_7",
+  "screenMaterial": "Material.002",
+  "lidNode": "Bevels_2",
+  "extensionsRequired": []
+}

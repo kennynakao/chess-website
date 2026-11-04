@@ -1,0 +1,38 @@
+Compute Rack (Data Centre Infiltration Kit)
+Creator: 3D Assets (@3dassets), 3DAssets.dev
+License: Creative Commons CC0 1.0 Universal (public-domain dedication)
+License URL: https://creativecommons.org/publicdomain/zero/1.0/
+Source: https://3dassets.dev/assets/data-centre-infiltration-kit-data-centre-infiltration--49b6521a
+Direct original download: https://cdn.3dassets.dev/assets/29226/v1/model.glb
+Downloaded: 2026-10-27
+
+The source explicitly releases this downloadable model under CC0, allowing
+commercial use, modification and redistribution without required attribution.
+It describes an original detailed compute cabinet and reports that AI tools
+were used. This is an illustrative data-centre rack, not an official Vercel
+hardware model. No manufacturer identity or endorsement is implied.
+
+File: compute-rack.glb (343488 bytes; 15444 triangles).
+Unmodified download: 4 static meshes, 4 PBR materials, no external textures.
+Source page, preview, stats, validation report and full CC0 text accompany it.
+Khronos glTF validator result: 0 errors, 0 warnings.
+
+Suggested optional site credit:
+"Compute Rack by 3D Assets, from Data Centre Infiltration Kit (CC0 1.0)."
+
+Three.js loading: standard GLTFLoader. The model uses KHR_mesh_quantization,
+which GLTFLoader supports without an extra Draco/Meshopt/KTX2 decoder.
+Axes: +Y up, +Z toward the front equipment trays/status indicators.
+Origin: centered horizontally, bottom on Y=0. Keep original node transforms.
+Approximate dimensions (X/Y/Z): 0.754 x 2.235 x 1.113 meters.
+Exact computed bounds and SHA256 are in stats.json.
+
+Named root: data-centre-infiltration-kit-compute-rack
+Named children:
+  data-centre-infiltration-kit-compute-rack_0: dark metal cabinet
+  data-centre-infiltration-kit-compute-rack_1: steel equipment
+  data-centre-infiltration-kit-compute-rack_2: cyan emissive indicators
+  data-centre-infiltration-kit-compute-rack_3: rubber/dark details
+Original material names: dark, steel, cyan, rubber.
+Use an environment map and soft neutral key light to bring out the real
+geometry and metallic trays; keep the indicator material's subtle emission.

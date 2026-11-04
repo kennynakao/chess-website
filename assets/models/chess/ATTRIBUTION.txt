@@ -1,0 +1,8 @@
+Chess Set by Riley Queen / Poly Haven
+Source: https://polyhaven.com/a/chess_set
+License: CC0 1.0 Universal (public domain)
+License details: https://polyhaven.com/license
+Downloaded 2026-10-27 from the official Poly Haven API, 1K glTF edition.
+All downloaded files verified against published MD5 hashes.
+Changes: JPEG textures recompressed at 85% quality for web loading.
+The chessboard is illustrative; it is not a CAD model of DUEN hardware.

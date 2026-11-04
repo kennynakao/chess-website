@@ -1,0 +1,42 @@
+85 x 56 mm single-board computer
+Creator: Innerscene
+License: Creative Commons CC0 1.0 Universal (public-domain dedication)
+License URL: https://creativecommons.org/publicdomain/zero/1.0/
+Source: https://www.innerscene.com/tools/library/3d-parts/85-x-56-mm-single-board-computer-9b02b167
+Direct original download: https://www.innerscene.com/api/library/85-x-56-mm-single-board-computer-9b02b167/download
+Downloaded: 2026-10-27
+
+This is Innerscene's original unbranded single-board-computer illustration,
+not an official Raspberry Pi model or an exact representation of the installed Pi.
+Its source page explicitly dedicates the model to CC0 and allows use,
+modification and redistribution, including commercial use, without attribution.
+The downloaded GLB also embeds license=CC0-1.0 and source_credit=Innerscene.
+The saved source-page HTML and the full CC0 text accompany this file.
+
+Original: single-board-computer.glb (532152 bytes; 4940 triangles).
+Web version: single-board-computer-batched.glb (385116 bytes; 4940 triangles).
+Changes: 235 static meshes / 236 primitives batched into 5 meshes / 5 primitives,
+one per original material. Original vertex data, normals, UVs and triangle order
+within each part are preserved. All five embedded PNG textures are preserved
+byte for byte. No geometry decimation or replacement model was used.
+
+Suggested optional site credit:
+"Illustrative single-board computer by Innerscene (CC0 1.0); geometry batched for the web."
+
+Loading: standard Three.js GLTFLoader; no Draco, Meshopt or KTX2 decoder needed.
+Original axes: +Y is above the circuit board. USB/network ports face +X.
+For a +Z-facing model, set rotation.y = -Math.PI / 2 before normalizing bounds.
+Bounds in meters:
+  X: -0.042500000447 to +0.042500000447 (width 0.085000000894)
+  Y: +0.000001999999995 to +0.017602000386 (height 0.017600000386)
+  Z: -0.028000000864 to +0.028249999508 (depth 0.056250000373)
+Top of PCB: Y=0.004600000103.
+After -PI/2 Y rotation: width about 0.05625, height 0.01760, depth 0.08500.
+Batched node/material names: black, brass, aluminum, green,
+402_single_board_computer_silkscreen_2k.png.
+The black group includes both integrated-circuit packages; individual component
+names remain available in the unbatched original if needed for authoring.
+
+The model has five PBR materials, including metallic ports and GPIO contacts.
+Use neutral or slightly warm key lighting and an environment map; avoid replacing
+all materials with one flat color, which would erase the downloaded model's detail.

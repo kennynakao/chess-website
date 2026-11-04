@@ -1,0 +1,11 @@
+MacBook Pro 13 inch 2020
+Creator: timblewee (https://sketchfab.com/timblewee)
+Original source: https://sketchfab.com/3d-models/macbook-pro-13-inch-2020-efab224280fd4c3993c808107f7c0b38
+Download: https://sceneview.github.io/models/platforms/macbook_pro_13.glb
+License: Creative Commons Attribution 4.0 International (CC-BY-4.0)
+License text: https://creativecommons.org/licenses/by/4.0/
+License evidence: embedded asset.extras in original GLB; https://sceneview.github.io/credits.html; https://github.com/sceneview/sceneview/blob/main/assets/catalog.json
+Modification: lid posed open 105 degrees; animation tracks removed. Geometry, materials and textures retained.
+Suggested visible credit: MacBook Pro 13 inch 2020 by timblewee, CC BY 4.0. Adapted to a static open pose.
+
+Web rendering adaptation: replaced display artwork with DUEN and separated the display from its black-glass backing to prevent depth flicker.
