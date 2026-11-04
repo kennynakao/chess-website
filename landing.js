@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import {mergeGeometries} from 'three/addons/utils/BufferGeometryUtils.js';
+import {mergeGeometries,toCreasedNormals} from 'three/addons/utils/BufferGeometryUtils.js';
 import {RoomEnvironment} from 'three/addons/environments/RoomEnvironment.js';
 const canvas=document.querySelector('#scene');
 const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -19,24 +19,33 @@ scene.add(new THREE.HemisphereLight(0xdfe8f2,0x08050d,.32));
 const key=new THREE.DirectionalLight(0xe9edf4,2.4);key.position.set(-3,7,5);key.castShadow=true;key.shadow.mapSize.set(1024,1024);key.shadow.camera.left=-10;key.shadow.camera.right=10;key.shadow.camera.top=10;key.shadow.camera.bottom=-10;key.shadow.bias=-.0004;key.shadow.normalBias=.03;scene.add(key);
 const rim=new THREE.DirectionalLight(0xb49acb,1.0);rim.position.set(5,3,-4);scene.add(rim);
 const fill=new THREE.DirectionalLight(0xffffff,.65);fill.position.set(3,0,6);scene.add(fill);
-// Turned wood profiles with continuous grain, used for the complete starting army.
+// Continuous wood grain, used for the complete starting army.
 const woodCanvas=document.createElement('canvas');woodCanvas.width=256;woodCanvas.height=512;
 const wc=woodCanvas.getContext('2d'),pixels=wc.createImageData(256,512);
 for(let y=0;y<512;y++)for(let x=0;x<256;x++){const wave=Math.sin(x*.23+Math.sin(y*.018)*3)+.4*Math.sin(x*.77+y*.012);const n=(Math.random()-.5)*9;const i=(y*256+x)*4;pixels.data[i]=132+wave*19+n;pixels.data[i+1]=78+wave*12+n;pixels.data[i+2]=41+wave*7+n;pixels.data[i+3]=255;}
 wc.putImageData(pixels,0,0);const grain=new THREE.CanvasTexture(woodCanvas);grain.colorSpace=THREE.SRGBColorSpace;grain.wrapS=grain.wrapT=THREE.RepeatWrapping;
 const wood=new THREE.MeshStandardMaterial({map:grain,color:0xe5bd89,roughness:.38,metalness:0,envMapIntensity:.7});
 const ebony=new THREE.MeshStandardMaterial({map:grain,color:0x39282d,roughness:.36,metalness:0,envMapIntensity:.8});
-function makePiece(type,mat){
- const group=new THREE.Group();const height={p:1.2,r:1.35,n:1.5,b:1.65,q:1.85,k:2}[type];
- const profile=[[0,0],[.33,0],[.36,.06],[.36,.13],[.30,.2],[.27,.24],[.24,.3],[.19,.4],[.14,.58],[.13,.72],[.22,.78],[.23,.84],[.14,1.05],[0,1.05]];
- const points=profile.map(([x,y])=>new THREE.Vector2(x,y*height*.75));
- const mesh=new THREE.Mesh(new THREE.LatheGeometry(points,32),mat);group.add(mesh);
- const topY=height*.75;
- if(type==='r'){const crown=new THREE.Mesh(new THREE.CylinderGeometry(.29,.25,.25,48),mat);crown.position.y=topY;group.add(crown);for(let i=0;i<6;i++){const t=new THREE.Mesh(new THREE.BoxGeometry(.12,.17,.12),mat);t.position.set(Math.cos(i*Math.PI/3)*.23,topY+.17,Math.sin(i*Math.PI/3)*.23);group.add(t);}}
- else if(type==='n'){const head=new THREE.Mesh(new THREE.ConeGeometry(.23,.55,4),mat);head.position.set(0,topY+.12,-.03);head.rotation.z=.25;group.add(head);const nose=new THREE.Mesh(new THREE.BoxGeometry(.18,.18,.3),mat);nose.position.set(0,topY+.18,-.15);group.add(nose);}
- else {const head=new THREE.Mesh(new THREE.SphereGeometry(type==='p'?.235:.2,24,16),mat);head.position.y=topY+.14;head.scale.y=type==='b'?1.6:1;group.add(head);if(type==='k'){for(const [w,h] of [[.08,.38],[.29,.08]]){const cross=new THREE.Mesh(new THREE.BoxGeometry(w,h,.08),mat);cross.position.y=topY+.54;group.add(cross);}}if(type==='q'){for(let i=0;i<7;i++){const bead=new THREE.Mesh(new THREE.SphereGeometry(.06,12,8),mat);bead.position.set(Math.cos(i*2*Math.PI/7)*.19,topY+.3,Math.sin(i*2*Math.PI/7)*.19);group.add(bead);}}}
- group.traverse(o=>{if(o.isMesh){o.castShadow=true;o.receiveShadow=true;}});return group;
+// The chess piece models: binary STL in millimetres, Y up. One scale keeps their true proportions.
+const MODEL_SCALE=.028,modelNames={p:'pawn',n:'knight',b:'bishop',r:'rook',q:'queen',k:'king'};
+async function loadModel(name){
+ const response=await fetch(`assets/models/${name}.stl`);
+ if(!response.ok)throw new Error(`Could not load the ${name} model`);
+ const data=new DataView(await response.arrayBuffer()),count=data.getUint32(80,true),positions=new Float32Array(count*9);
+ for(let t=0;t<count;t++)for(let v=0;v<9;v++)positions[t*9+v]=data.getFloat32(96+t*50+v*4,true);
+ const raw=new THREE.BufferGeometry();raw.setAttribute('position',new THREE.BufferAttribute(positions,3));
+ // Smooth curves but keep sharp edges. This hashes vertex positions, so it runs before scaling down.
+ const geometry=toCreasedNormals(raw,Math.PI/6);
+ geometry.computeBoundingBox();const {min,max}=geometry.boundingBox;
+ geometry.translate(-(min.x+max.x)/2,-min.y,-(min.z+max.z)/2);geometry.scale(MODEL_SCALE,MODEL_SCALE,MODEL_SCALE);
+ // STL has no texture coordinates: project the grain straight through, as if cut from one block.
+ const p=geometry.attributes.position,uv=new Float32Array(p.count*2);
+ for(let i=0;i<p.count;i++){uv[i*2]=(p.getX(i)+p.getZ(i)*.6)*.55;uv[i*2+1]=p.getY(i)*.25;}
+ geometry.setAttribute('uv',new THREE.BufferAttribute(uv,2));
+ return geometry;
 }
+const models=Object.fromEntries(await Promise.all(Object.entries(modelNames).map(async([type,name])=>[type,await loadModel(name)])));
+function makePiece(type,mat){const mesh=new THREE.Mesh(models[type],mat);mesh.castShadow=true;mesh.receiveShadow=true;return mesh;}
 const pawn=makePiece('p',wood.clone());scene.add(pawn);
 const board=new THREE.Group();scene.add(board);
 const base=new THREE.Mesh(new THREE.BoxGeometry(9,.28,9),new THREE.MeshStandardMaterial({color:0x101216,metalness:.4,roughness:.4}));base.position.y=-.19;board.add(base);
@@ -46,7 +55,8 @@ const dark=new THREE.MeshStandardMaterial({color:0x352331,roughness:.5});
 for(let x=0;x<8;x++)for(let z=0;z<8;z++){const tile=new THREE.Mesh(tileGeo,(x+z)%2?dark:light);tile.position.set(x-3.5,0,z-3.5);board.add(tile);}
 const order=['r','n','b','q','k','b','n','r'];
 for(let file=0;file<8;file++)for(const side of [0,1]){
-const mat=side===0?wood:ebony;const major=makePiece(order[file],mat);major.position.set(file-3.5,.035,side===0?3.5:-3.5);if(side)major.rotation.y=Math.PI;board.add(major);
+// The flat knight model's muzzle points along +X: turn knights inward so the camera sees their profile, not their edge.
+const mat=side===0?wood:ebony;const major=makePiece(order[file],mat);major.position.set(file-3.5,.035,side===0?3.5:-3.5);if(order[file]==='n'?file>3:side)major.rotation.y=Math.PI;board.add(major);
 if(!(side===0&&file===4)){const p=makePiece('p',mat);p.position.set(file-3.5,.035,side===0?2.5:-2.5);board.add(p);}}
 board.updateMatrixWorld(true);const batches=new Map();
 board.traverse(o=>{if(!o.isMesh)return;const g=o.geometry.clone().applyMatrix4(o.matrixWorld);if(!batches.has(o.material))batches.set(o.material,[]);batches.get(o.material).push(g);});board.clear();

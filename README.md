@@ -15,6 +15,7 @@ The current integration runs chess logic and Stockfish; it does not drive motors
 
 - `index.html`, `landing.js`, `landing.css`: the animated landing page.
 - `play.html`, `app.js`, `chess.js`, `style.css`: the chess interface.
+- `assets/models/`: the chess piece models (STL) shown in the landing scene.
 - `assets/vendor/`: the locally served Three.js runtime and its license.
 - `api/[action].js`: Vercel login/session handling and server-only Pi proxy.
 - `backend/remote_server.py`: loopback-only authenticated Pi API and SQLite state.
