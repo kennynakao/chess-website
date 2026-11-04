@@ -17,12 +17,16 @@ x = -1 and -2, Black's at x = 8 and 9, with y from 0 to 7. Those slots are named
 
 A step with op "note" moves nothing; it is a message for whoever is watching.
 
-Three ways to perform a job, chosen by driver_from_env():
+This is the gantry's slot in website board games, which board_pipeline.py runs in this
+order: the player's move, gantry, camera, Stockfish's move, gantry, camera, back to the
+player. The website's digital game and playing in person with pi_game.py or pi_touch.py
+are separate and never come through here. Four ways to perform a job, chosen by
+driver_from_env():
 
-    CHESS_MOTION_COMMAND=...   a motor program moves the pieces
-    CHESS_BOARD_MODE=manual    a person moves them, as in the pi-only branch of
-                               Self-Moving-Chess-Board-Code, and confirms on the website
-    neither                    nothing moves; the jobs are only logged
+    CHESS_MOTION_COMMAND=...    a gantry program: it gets each job as JSON on standard input
+    CHESS_GANTRY=arduino        the Pi-to-Arduino driver in gantry.py: NOT DONE YET, every job stops the game
+    CHESS_BOARD_MODE=manual     a person moves the pieces and confirms on the website
+    none of these               no gantry yet: the job is logged and the game carries on
 """
 
 from __future__ import annotations
@@ -31,14 +35,16 @@ import json
 import logging
 import os
 import shlex
+import signal
 import subprocess
 
 import chess
 
 SLOTS_PER_COLOR = 16
 SLOTS_PER_COLUMN = 8
-# A full reset can carry every piece on the board, so this is deliberately generous.
-COMMAND_TIMEOUT_SECONDS = 900
+# A full reset can carry every piece on the board, so the limit grows with the job.
+COMMAND_TIMEOUT_SECONDS = 60
+COMMAND_TIMEOUT_PER_STEP_SECONDS = 30
 
 
 def _xy(name: str) -> tuple[float, float]:
@@ -174,6 +180,11 @@ def plan_transition(before: list[str], after: list[str], new_game: bool = False)
     raise ValueError("These game histories are not connected by moves or takebacks.")
 
 
+def starting_position_check() -> dict:
+    """A job with nothing to move: someone sets up the board, and it is checked before play."""
+    return {"label": "reset", "steps": [], "expect": _on_board(Layout())}
+
+
 def describe_job(job: dict) -> list[str]:
     """What a person has to do to perform a job by hand."""
     if job["label"] == "reset":
@@ -195,12 +206,12 @@ def describe_job(job: dict) -> list[str]:
 
 
 class SimulatedDriver:
-    """The default when nothing is connected: records the signals and moves nothing."""
+    """The default until a gantry is connected: the pipeline logs each job and moves on."""
     name = "simulated"
     moves_pieces, needs_person = False, False
 
     def execute(self, job: dict) -> None:
-        logging.info("MOTION simulated job=%s label=%s steps=%s", job["id"], job["label"], json.dumps(job["steps"]))
+        logging.info("PIPELINE %s gantry: not connected, nothing moved", job["label"])
 
 
 class CommandDriver:
@@ -212,12 +223,35 @@ class CommandDriver:
     name = "command"
     moves_pieces, needs_person = True, False
 
-    def __init__(self, command: str, timeout: float = COMMAND_TIMEOUT_SECONDS) -> None:
+    def __init__(self, command: str, timeout: float | None = None) -> None:
         self.args, self.timeout = shlex.split(command), timeout
 
     def execute(self, job: dict) -> None:
+        timeout = self.timeout or COMMAND_TIMEOUT_SECONDS + COMMAND_TIMEOUT_PER_STEP_SECONDS * len(job["steps"])
         # Its output goes straight to the service log, which is where to debug the motors.
-        subprocess.run(self.args, input=json.dumps(job), text=True, timeout=self.timeout, check=True)
+        # Its own process group, so that stopping it also stops anything it started: nothing
+        # may keep driving motors while someone is fixing the pieces by hand.
+        process = subprocess.Popen(self.args, stdin=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            process.communicate(json.dumps(job), timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self._stop(process)
+            raise
+        if process.returncode:
+            raise subprocess.CalledProcessError(process.returncode, self.args)
+
+    @staticmethod
+    def _stop(process: subprocess.Popen) -> None:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass  # The group already ended, and its id may even belong to someone else by now.
+        process.wait()
 
 
 class ManualDriver:
@@ -233,4 +267,10 @@ def driver_from_env():
     command = os.environ.get("CHESS_MOTION_COMMAND", "").strip()
     if command:
         return CommandDriver(command)
+    gantry = os.environ.get("CHESS_GANTRY", "").strip().lower()
+    if gantry == "arduino":
+        from backend.gantry import arduino_from_env
+        return arduino_from_env()
+    if gantry:
+        logging.warning("GANTRY CHESS_GANTRY=%r is not a known driver; nothing is connected", gantry)
     return ManualDriver() if os.environ.get("CHESS_BOARD_MODE", "").strip() == "manual" else SimulatedDriver()

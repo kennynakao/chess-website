@@ -35,7 +35,8 @@
     canControl: false, engineError: null, error: null, levels: [], motion: null,
     revision: 0, gameId: null, snapshot: null, probing: null,
     accept(data) {
-      if (this.snapshot && data.revision < this.revision) return this.snapshot;
+      // Revisions only compare within one database: after a fresh install the numbers start again.
+      if (this.snapshot && data.serverId === this.snapshot.serverId && data.revision < this.revision) return this.snapshot;
       this.available = true;
       this.authenticated = true;
       this.engine = !!data.engine;
@@ -100,7 +101,8 @@
         }
       } finally { this.pending = false; renderConnection(); renderControls(); renderNewGamePanel(); }
     },
-    newGame(level) { return this.call('api/new', { level }); },
+    // board: true plays on the physical board (gantry, camera, Stockfish, gantry, camera); false is the digital game.
+    newGame(level, board) { return this.call('api/new', { level, board: board === true }); },
     move(from, to, promotion) { return this.call('api/move', { from, to, promotion: promotion || null }); },
     undo() { return this.call('api/undo', {}); },
   };
@@ -111,6 +113,8 @@
     game: new Chess(),
     status: 'idle',          // idle | playing | over
     mode: 'engine',        // engine (backend Stockfish) | computer (local casual bot) | friend
+    board: false,          // this engine game is played out on the physical board (set by the Pi)
+    boardPref: false,      // what the next engine game should be
     playerColor: 'w',
     colorPref: 'random',
     level: 'beginner',
@@ -142,6 +146,7 @@
     panelNew: $('#panel-new'), panelGame: $('#panel-game'),
     tcButton: $('#tc-button'), tcLabel: $('#tc-label'), tcMenu: $('#tc-menu'),
     levelRow: $('#level-row'), levelPick: $('#level-pick'), backendStatus: $('#backend-status'),
+    boardRow: $('#board-row'), boardPick: $('#board-pick'), boardPickNote: $('#board-pick-note'),
     playBtn: $('#play-btn'), playFriend: $('#play-friend'), playBot: $('#play-bot'),
     playBotTitle: $('#play-bot-title'), playBotSub: $('#play-bot-sub'),
     colorRow: $('#color-row'), colorPick: $('#color-pick'),
@@ -256,7 +261,7 @@
   }
 
   function opponentLabel() {
-    if (state.mode === 'engine') return `vs Stockfish (${levelInfo(state.level).label})`;
+    if (state.mode === 'engine') return `vs Stockfish (${levelInfo(state.level).label})${state.board ? ' · on the board' : ''}`;
     if (state.mode === 'computer') return 'vs Computer';
     return 'Pass & Play';
   }
@@ -267,7 +272,7 @@
 
   function save() {
     try {
-      localStorage.setItem('duen.chess.prefs', JSON.stringify({ tc: state.tc.id, color: state.colorPref, sound: state.sound, level: state.level, pieceStyle: state.pieceStyle }));
+      localStorage.setItem('duen.chess.prefs', JSON.stringify({ tc: state.tc.id, color: state.colorPref, sound: state.sound, level: state.level, pieceStyle: state.pieceStyle, board: state.boardPref }));
     } catch (e) { /* ignore */ }
   }
   function restore() {
@@ -278,6 +283,7 @@
       if (p.level) state.level = p.level;
       if (p.pieceStyle === 'regular') state.pieceStyle = 'regular';
       if (typeof p.sound === 'boolean') state.sound = p.sound;
+      state.boardPref = p.board === true;
     } catch (e) { /* ignore */ }
   }
 
@@ -418,7 +424,7 @@
       av.className = 'avatar ' + n.cls;
       av.textContent = n.initial;
       let name = n.name + (n.sub ? `<small>(${n.sub})</small>` : '');
-      if (state.thinking && n.cls === 'bot' && state.status === 'playing') name += '<span class="thinking">thinking…</span>';
+      if ((state.thinking || stockfishThinking()) && n.cls === 'bot' && state.status === 'playing') name += '<span class="thinking">thinking…</span>';
       $('.player-name', bar).innerHTML = name;
       const cap = $('.captured', bar);
       let html = '';
@@ -493,7 +499,7 @@
     el.btnResign.disabled = state.mode === 'engine' || !playing || Backend.pending;
     el.resignLabel.textContent = playing && plies < 2 ? 'Abort' : 'Resign';
     el.btnTakeback.disabled = !playing || plies === 0 || state.thinking || Backend.pending ||
-      (state.mode === 'engine' && (!Backend.available || !Backend.canControl));
+      (state.mode === 'engine' && (!Backend.available || !Backend.canControl || boardBusy()));
     el.btnRematch.disabled = el.btnNewGame.disabled = Backend.pending;
     $('#remote-newgame').disabled = Backend.pending || state.thinking;
     const cur = state.viewPly === null ? plies : state.viewPly;
@@ -523,23 +529,66 @@
     const waiting = motion.state === 'waiting';
     el.motionResolve.classList.toggle('hidden', !((boardFaulted() || waiting && motion.mismatch) && Backend.canControl));
     el.boardConfirm.classList.toggle('hidden', !(waiting && Backend.canControl));
-    el.boardScan.classList.toggle('hidden', !(motion.camera && motion.state === 'idle' && state.mode === 'engine' && canInteract()));
+    el.boardConfirm.disabled = false;
+    el.boardScan.classList.toggle('hidden', !(motion.camera && motion.state === 'idle' && state.mode === 'engine' && state.board && canInteract()));
   }
 
+  // The physical board stopped. That concerns the hardware, whatever game is on screen.
   const boardFaulted = () => !!Backend.motion && Backend.motion.state === 'fault';
+  // In a board game a move runs gantry, camera, Stockfish, gantry, camera, and it is the player's turn
+  // only after all of them. A digital game never waits for the board.
+  const boardBusy = () => state.board && !!Backend.motion && ['moving', 'waiting', 'fault'].includes(Backend.motion.state);
+  const stockfishThinking = () => state.board && !!Backend.motion && Backend.motion.stage === 'stockfish';
 
-  /** What the physical board is doing; empty when there is nothing to say. */
+  let followTimer = null, followingMyMove = false;
+  function followBoard() {
+    if (followTimer) return;
+    followTimer = setTimeout(() => { followTimer = null; followBoardOnce(); }, 700);
+  }
+
+  /** Catch up with the pipeline: Stockfish's move appears as soon as it is played, then the turn comes back. */
+  async function followBoardOnce() {
+    const before = state.game.history.length, wasPlaying = state.status === 'playing';
+    await reconnectPi();
+    if (state.mode !== 'engine') return;
+    if (followingMyMove && wasPlaying && state.status === 'over') announceResult();
+    else if (state.game.history.length > before) Sound.play(Backend.snapshot && Backend.snapshot.check ? 'check' : 'move');
+    if (Backend.available && boardBusy()) { followBoard(); return; }
+    followingMyMove = false;
+    playPremove();
+  }
+
+  /** What the physical board is doing; empty when there is nothing to say, and silent during a digital game. */
   function motionText() {
     const motion = Backend.motion;
     if (!motion) return '';
-    if (motion.state === 'fault') return 'Board stopped: set the pieces to match the screen, then confirm';
+    if (motion.state === 'fault') {
+      if (!Backend.canControl) return 'Board stopped: the player is fixing it';
+      return `Board stopped: ${motion.error ? `${motion.error} ` : ''}Set the pieces to match the screen, then confirm`;
+    }
+    if (!state.board) return '';
     if (motion.state === 'waiting') {
       const queued = motion.pending ? ` (+${motion.pending} queued)` : '';
       return [`On the board: ${(motion.instructions || []).join(' ')}${queued}`, boardProblemText(motion.mismatch)].filter(Boolean).join(' ');
     }
-    if (motion.state === 'moving') return `Board moving ${motion.current}${motion.pending ? ` (+${motion.pending} queued)` : ''}`;
-    if (motion.mode === 'simulated') return 'Motors not connected';
+    if (motion.state === 'moving') {
+      const connected = motion.mode === 'simulated' ? ' (not connected)' : '';
+      if (motion.stage === 'stockfish') return 'Stockfish thinking';
+      if (motion.stage === 'camera') return `Camera checking ${motion.current}`;
+      return `Gantry moving ${motion.current}${connected}`;
+    }
+    if (motion.mode === 'simulated') return motion.camera ? 'Gantry not connected' : 'Gantry and camera not connected';
+    if (motion.mode === 'arduino') return 'Gantry code not written yet';
     return motion.mode === 'manual' ? 'Moving pieces by hand' : 'Board ready';
+  }
+
+  /** The state of the hardware, for the "On the board" choice before a game starts. */
+  function boardOptionNote(motion) {
+    if (!motion) return 'Pieces move on the physical board';
+    if (motion.mode === 'simulated') return motion.camera ? 'Gantry not connected yet' : 'Gantry and camera not connected yet';
+    if (motion.mode === 'arduino') return 'Gantry code not written yet';
+    if (motion.mode === 'manual') return 'You move the pieces by hand';
+    return motion.camera ? 'Gantry moves, camera checks' : 'Gantry moves the pieces';
   }
 
   /** What the camera saw wrong, in plain words. */
@@ -553,9 +602,14 @@
     return `The camera sees ${parts.join(' and ')}.`;
   }
 
+  /** Tell the Pi the step on screen is done. Names that step, so a double press can't confirm the next one. */
   async function confirmBoard(override = false) {
-    try { await Backend.request('api/board-confirm', override ? { override: true } : {}); await reconnectPi({ force: true }); }
+    el.boardConfirm.disabled = true;
+    const jobId = Backend.motion && Backend.motion.jobId;
+    try { await Backend.request('api/board-confirm', { ...(override ? { override: true } : {}), ...(jobId ? { jobId } : {}) }); }
     catch (err) { toast(err.message, 4500); }
+    // Give the Pi a moment to move on. Unforced, so this never replaces a game or panel on screen.
+    setTimeout(() => reconnectPi(), 300);
   }
 
   /** Photograph the board and, if the photo shows exactly one legal move, play it. */
@@ -584,8 +638,15 @@
       el.levelPick.innerHTML = Backend.levels.map(l =>
         `<button type="button" class="${l.id === state.level ? 'on' : ''}" data-level="${l.id}">${l.label}<small>${l.description || ''}</small></button>`).join('');
     }
+    // The choice between the digital game and the board game, once the Pi has said what hardware it has.
+    const hardware = Backend.available ? Backend.motion : null;
+    el.boardRow.classList.toggle('hidden', !hardware);
+    if (hardware) {
+      $$('button', el.boardPick).forEach((button) => button.classList.toggle('on', (button.dataset.board === '1') === state.boardPref));
+      el.boardPickNote.textContent = boardOptionNote(hardware);
+    }
     el.playBotTitle.textContent = 'Play on the Pi';
-    el.playBotSub.textContent = 'You play White · unlimited time';
+    el.playBotSub.textContent = hardware && state.boardPref ? 'You play White · the pieces move on the board' : 'You play White · unlimited time';
     el.playBtn.textContent = Backend.pending ? 'Please wait…' : 'Play on the Pi';
     el.playBtn.disabled = el.playBot.disabled = Backend.pending || (Backend.authenticated && (!Backend.available || !Backend.engine || !Backend.canControl));
     el.playFriend.disabled = Backend.pending;
@@ -620,7 +681,7 @@
     state.game = new Chess(); state.snapshots = []; pushSnapshot(null);
     for (const rec of records) pushSnapshot(state.game.move(rec.move));
     state.gameId++;
-    state.mode = 'engine'; state.playerColor = 'w';
+    state.mode = 'engine'; state.playerColor = 'w'; state.board = data.board === true;
     state.tc = TIME_CONTROLS.find(t => t.id === 'inf'); state.running = null;
     state.level = data.level || state.level;
     state.selected = null; state.legal = []; state.pendingPromo = null; state.drag = null; state.hoverSq = null;
@@ -642,7 +703,8 @@
     const data = await Backend.probe();
     if (data && generation === state.gameId && !Backend.pending && !state.thinking && (force || state.mode === 'engine' &&
         (previousGame !== data.gameId || previousRevision !== data.revision || !sameBoard(state.game.fen(), data.fen)))) {
-      try { applyRemoteState(data); } catch (err) { Backend.available = false; Backend.error = err.message; toast(err.message, 4500); }
+      // A routine poll keeps a queued premove: it may be for the Stockfish reply this very poll brings.
+      try { applyRemoteState(data, { preservePremove: !force }); } catch (err) { Backend.available = false; Backend.error = err.message; toast(err.message, 4500); }
     }
     renderNewGamePanel(); renderControls();
   }
@@ -675,7 +737,7 @@
     if (mode !== 'friend') {
       if (!Backend.authenticated) { showAccess(); return; }
       if (!Backend.available || !Backend.engine || !Backend.canControl) { toast('The Pi is not ready for a new game. Reconnect to check.'); return; }
-      try { applyRemoteState(await Backend.newGame(state.level)); Sound.play('start'); }
+      try { applyRemoteState(await Backend.newGame(state.level, state.boardPref)); Sound.play('start'); }
       catch (err) { await reconnectPi({ force: true }); toast(err.message, 4500); }
       return;
     }
@@ -689,7 +751,7 @@
 
   function canPremove() {
     return state.status === 'playing' && state.mode !== 'friend' &&
-      (state.mode !== 'engine' || Backend.available && Backend.canControl && !boardFaulted()) &&
+      (state.mode !== 'engine' || Backend.available && Backend.canControl && !(state.board && boardFaulted())) &&
       state.game.turn !== state.playerColor && !state.pendingPromo && state.viewPly === null;
   }
 
@@ -734,7 +796,7 @@
 
   function canInteract() {
     return state.status === 'playing' && !state.pendingPromo && !state.thinking &&
-      (state.mode !== 'engine' || Backend.available && Backend.canControl && !Backend.pending && !boardFaulted()) &&
+      (state.mode !== 'engine' || Backend.available && Backend.canControl && !Backend.pending && !boardBusy()) &&
       (state.mode === 'friend' || state.game.turn === state.playerColor);
   }
 
@@ -820,7 +882,7 @@
   // Run the engine and this presentation delay together so engine time is included.
   const botThinkMilliseconds = () => 1000 + Math.random() * 2000;
 
-  /** Send the human move to chess_game.py and play Stockfish's reply. */
+  /** Send the human move to the Pi. In a digital game the reply comes back with it; in a board game the screen follows the pipeline. */
   async function requestEngineMove(rec) {
     state.thinking = true; renderPlayers(); renderControls();
     try {
@@ -830,6 +892,8 @@
       else Sound.play(res.check ? 'check' : 'move');
       // Metadata is updated before a queued premove starts the next request.
       playPremove();
+      followingMyMove = true;
+      if (boardBusy()) followBoard();
     } catch (err) {
       state.thinking = false; state.premove = null;
       // Restore the last confirmed position while status reconciliation runs.
@@ -1144,6 +1208,13 @@
     save();
     renderNewGamePanel();
   });
+  el.boardPick.addEventListener('click', (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    state.boardPref = b.dataset.board === '1';
+    save();
+    renderNewGamePanel();
+  });
   const startComputerGame = () => startGame('engine');
   el.playBtn.addEventListener('click', startComputerGame);
   el.playBot.addEventListener('click', startComputerGame);
@@ -1270,7 +1341,7 @@
   $('#remote-newgame').addEventListener('click', newGame);
   el.motionResolve.addEventListener('click', async () => {
     if (!boardFaulted()) { await confirmBoard(true); return; }
-    try { await Backend.request('api/motion-resolve', {}); await reconnectPi({ force: true }); }
+    try { await Backend.request('api/motion-resolve', {}); await reconnectPi(); }
     catch (err) { toast(err.message, 4500); }
   });
   el.boardConfirm.addEventListener('click', () => confirmBoard());
@@ -1285,6 +1356,6 @@
   renderNewGamePanel();
   renderAll();
   reconnectPi({ force: true });
-  setInterval(() => { if (!document.hidden) reconnectPi(); }, 5000);
+  setInterval(async () => { if (document.hidden) return; await reconnectPi(); if (boardBusy()) followBoard(); }, 5000);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) reconnectPi(); });
 })();

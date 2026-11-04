@@ -1,14 +1,20 @@
 """See the physical board, so the game can check it against what should be there.
 
-The vision code lives on the pi-only branch of Self-Moving-Chess-Board-Code
-(board_vision.py and pi_camera.py). VisionCamera loads it from a checkout on the Pi:
+This is the camera's slot in website games. The vision code lives on the pi-only branch
+of Self-Moving-Chess-Board-Code. If a checkout of it is at ~/chess-board-pi-only or
+~/Self-Moving-Chess-Board-Code, the service uses it automatically, without changing it.
+It runs under that checkout's own .venv, so the game service does not need OpenCV.
 
-    CHESS_VISION_DIR       that checkout; without it the service runs with no camera
+The camera only switches on once that .venv and a calibration from `pi_game.py setup`
+both exist, because each photo depends on them. Until then the game still runs: a person
+moves the pieces and their word is taken for it. Restart the service after calibrating.
+These settings change the defaults:
+
+    CHESS_VISION_DIR       the checkout, if it is somewhere else
+    CHESS_VISION_PYTHON    its Python, if it is not at .venv/bin/python
     CHESS_CALIBRATION_DIR  what `pi_game.py setup` wrote (default: calibration/ in the checkout)
     CHESS_CAMERA           "pi" (default) or "usb"
     CHESS_CAMERA_DEVICE    camera index (default 0)
-
-The service's virtual environment also needs that branch's requirements, for OpenCV.
 
 A camera only sees which squares are occupied, not which piece is on them. Moves that
 leave the same squares occupied, such as the four promotions, therefore come back as
@@ -17,13 +23,21 @@ leave the same squares occupied, such as the four promotions, therefore come bac
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import chess
+
+BRIDGE = Path(__file__).with_name("vision_bridge.py")
+DEFAULT_VISION_DIRS = ("~/chess-board-pi-only", "~/Self-Moving-Chess-Board-Code")
+# Under the website's 25 second limit, so a stuck camera is reported as a camera problem
+# and not as an offline Pi. Loading OpenCV and taking the photo normally takes a few seconds.
+PHOTO_TIMEOUT_SECONDS = 20
 
 
 @dataclass(frozen=True)
@@ -70,38 +84,64 @@ def scan_result(board: chess.Board, observation: BoardObservation) -> dict:
     return {**result, "missing": sorted(now - observation.occupied), "extra": sorted(observation.occupied - now)}
 
 
+class CameraError(RuntimeError):
+    """The pi-only code could not produce a reading of the board."""
+
+
 class VisionCamera:
-    """Adapter for the pi-only branch's camera and vision modules."""
+    """Connector to the pi-only code. Each photo runs vision_bridge.py under that code's own Python."""
     name = "vision"
 
-    def __init__(self, vision_dir: str | Path, calibration_dir: str | Path | None = None,
-                 kind: str = "pi", device: int = 0) -> None:
-        vision_dir = Path(vision_dir).expanduser()
-        if str(vision_dir) not in sys.path:
-            sys.path.insert(0, str(vision_dir))
-        # Imported here so the service needs no OpenCV unless a camera is configured.
-        from board_vision import load_calibration, observe, read_image
-        from pi_camera import Camera
-        self.directory = Path(calibration_dir).expanduser() if calibration_dir else vision_dir / "calibration"
-        self._observe, self._read_image = observe, read_image
-        self.calibration, self.reference = load_calibration(self.directory)
-        self.camera = Camera(kind, device)
+    def __init__(self, vision_dir: str | Path, calibration_dir: str | Path | None = None, kind: str = "pi",
+                 device: int = 0, python: str | Path | None = None, timeout: float = PHOTO_TIMEOUT_SECONDS) -> None:
+        self.vision_dir = Path(vision_dir).expanduser()
+        if not (self.vision_dir / "board_vision.py").is_file():
+            raise FileNotFoundError(f"The pi-only code was not found in {self.vision_dir}")
+        self.calibration_dir = Path(calibration_dir).expanduser() if calibration_dir else self.vision_dir / "calibration"
+        venv_python = self.vision_dir / ".venv" / "bin" / "python"
+        self.python = str(python or (venv_python if venv_python.exists() else sys.executable))
+        self.kind, self.device, self.timeout = kind, device, timeout
 
     def observe(self) -> BoardObservation:
-        # One file, replaced each time: this service stays up, so photos must not pile up.
-        path = self.camera.capture(self.directory / "latest.jpg")
-        observation, _ = self._observe(self.reference, self._read_image(path), self.calibration)
-        return BoardObservation(frozenset(observation.occupied), tuple(observation.uncertain))
+        command = [self.python, str(BRIDGE), str(self.vision_dir), str(self.calibration_dir), self.kind, str(self.device)]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=self.timeout, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise CameraError(f"The vision code did not finish: {exc}") from exc
+        if result.returncode:
+            detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "no details"
+            raise CameraError(f"The vision code failed: {detail}")
+        try:
+            reading = json.loads(result.stdout.strip().splitlines()[-1])
+            return BoardObservation(frozenset(reading["occupied"]), tuple(reading["uncertain"]))
+        except (IndexError, KeyError, TypeError, ValueError) as exc:
+            raise CameraError(f"The vision code gave an unreadable answer: {result.stdout[-200:]!r}") from exc
+
+
+def find_vision_dir() -> Path | None:
+    """The pi-only checkout, if it is on this machine."""
+    configured = os.environ.get("CHESS_VISION_DIR", "").strip()
+    for candidate in ([configured] if configured else DEFAULT_VISION_DIRS):
+        vision_dir = Path(candidate).expanduser()
+        if (vision_dir / "board_vision.py").is_file():
+            return vision_dir
+        if configured or vision_dir.is_dir():
+            logging.error("CAMERA off: no board_vision.py in %s; it should be a checkout of the pi-only branch", vision_dir)
+    return None
 
 
 def camera_from_env():
-    vision_dir = os.environ.get("CHESS_VISION_DIR", "").strip()
-    if not vision_dir:
+    """The camera, or None when it cannot work yet, with the reason in the service log."""
+    vision_dir = find_vision_dir()
+    if vision_dir is None:
         return None
-    try:
-        return VisionCamera(vision_dir, os.environ.get("CHESS_CALIBRATION_DIR") or None,
-                            os.environ.get("CHESS_CAMERA", "pi"), int(os.environ.get("CHESS_CAMERA_DEVICE", "0")))
-    except Exception:
-        # Keep the game playable without board checks, and say why in the service log.
-        logging.exception("CAMERA unavailable; running without board checks")
+    python = Path(os.environ.get("CHESS_VISION_PYTHON") or vision_dir / ".venv" / "bin" / "python").expanduser()
+    calibration = Path(os.environ.get("CHESS_CALIBRATION_DIR") or vision_dir / "calibration").expanduser()
+    if not python.exists():
+        logging.warning("CAMERA off: %s does not exist; create that .venv from the checkout's requirements.txt", python)
         return None
+    if not (calibration / "calibration.json").is_file():
+        logging.warning("CAMERA off: no calibration in %s; run pi_game.py setup at the board, then restart", calibration)
+        return None
+    return VisionCamera(vision_dir, calibration, os.environ.get("CHESS_CAMERA", "pi"),
+                        int(os.environ.get("CHESS_CAMERA_DEVICE", "0")), python)

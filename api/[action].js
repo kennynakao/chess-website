@@ -44,6 +44,8 @@ module.exports = async function handler(req,res) {
     const reply=await fetch(new URL('/api/'+action,origin),{method:req.method,headers:{Authorization:'Bearer '+process.env.CHESS_RELAY_TOKEN,'Content-Type':'application/json','X-Player-Session':player},body:req.method==='POST'?JSON.stringify(body):undefined,signal:AbortSignal.timeout(25000),redirect:'error'});
     const data=await reply.json();
     if(data===null || typeof data!=='object') throw Error('Invalid Pi response');
+    // The player's own sign-in was checked above, so this means the two relay tokens differ.
+    if(reply.status===401) return json(res,503,{ok:false,error:'The website could not sign in to the Pi: CHESS_RELAY_TOKEN does not match on both sides.',code:'relay_rejected'});
     return json(res,reply.status,data);
   } catch {return json(res,503,{ok:false,error:'The Raspberry Pi is offline or did not reply. Your game stays saved; reconnect before moving again.'});}
 };

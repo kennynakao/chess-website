@@ -192,6 +192,16 @@ test('board confirmation and scanning reach the Pi for a signed-in player only',
   }
 });
 
+test('a relay token mismatch is reported as that, and never asks the player to sign in again', async () => {
+  const cookie = await login();
+  mockReply(401, { ok: false, error: 'Unauthorized.', code: 'unauthorized' });
+  const reply = await request('status', { method: 'GET', headers: { cookie } });
+  assert.equal(reply.status, 503);
+  assert.equal(reply.body.code, 'relay_rejected');
+  assert.equal(reply.body.loginRequired, undefined);
+  assert(!reply.raw.includes(ENV.CHESS_RELAY_TOKEN));
+});
+
 test('unsupported routes and methods cannot be relayed', async () => {
   assert.equal((await request('arbitrary')).status, 404);
   assert.equal((await request('move', { method: 'GET' })).status, 405);

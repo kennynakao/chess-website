@@ -324,13 +324,14 @@ a { color: inherit; text-decoration: none; }
 
 .level-row { display: flex; flex-direction: column; gap: 8px; }
 .level-pick { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-.level-pick button {
+.board-pick { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+.level-pick button, .board-pick button {
   background: var(--control); border: 2px solid transparent; border-radius: 6px; padding: 8px 4px;
   font-weight: 700; font-size: 14px; display: flex; flex-direction: column; gap: 2px; align-items: center;
 }
-.level-pick button small { font-weight: 500; font-size: 11px; color: var(--muted); }
-.level-pick button:hover { background: var(--control-hover); }
-.level-pick button.on { border-color: var(--gold); background: rgba(244, 192, 64, 0.16); color: var(--gold); }
+.level-pick button small, .board-pick button small { font-weight: 500; font-size: 11px; color: var(--muted); text-align: center; }
+.level-pick button:hover, .board-pick button:hover { background: var(--control-hover); }
+.level-pick button.on, .board-pick button.on { border-color: var(--gold); background: rgba(244, 192, 64, 0.16); color: var(--gold); }
 
 .backend-status {
   font-size: 12px; font-weight: 600; color: var(--muted); text-align: center;

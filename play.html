@@ -116,6 +116,14 @@
           <div class="level-pick" id="level-pick"></div>
         </div>
 
+        <div class="level-row hidden" id="board-row">
+          <span class="label">Where to play</span>
+          <div class="board-pick" id="board-pick">
+            <button type="button" data-board="0" class="on">On screen<small>Stockfish answers at once</small></button>
+            <button type="button" data-board="1">On the board<small id="board-pick-note">Pieces move on the physical board</small></button>
+          </div>
+        </div>
+
         <button class="btn-play" id="play-btn" type="button">Play</button>
 
         <div class="backend-status" id="backend-status">Connecting to Raspberry Pi…</div>

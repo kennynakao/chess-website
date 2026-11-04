@@ -1,16 +1,24 @@
-"""Regression tests for authoritative remote game transactions and API exposure."""
+"""Regression tests for authoritative remote game transactions and API exposure.
+
+RemoteGameTests play the digital game (the default). The QueueTestCase classes play
+board games, where every move runs through the gantry, the camera and Stockfish.
+"""
 import copy
 import http.client
 import json
+import os
 from pathlib import Path
 import tempfile
+import sqlite3
 import threading
 import time
 import unittest
+from unittest import mock
 import chess
 
 from backend.board_camera import BoardObservation, occupied_squares
-from backend.board_motion import ManualDriver
+from backend.board_motion import ManualDriver, driver_from_env
+from backend.gantry import NOT_DONE, ArduinoGantry
 from backend.remote_server import ApiError, GameService, create_server
 
 ALICE = "a" * 32
@@ -53,15 +61,29 @@ class RemoteGameTests(unittest.TestCase):
                 "expectedRevision": state["revision"], **fields}
         return self.service.mutate(route, body, player), body
 
+    def settled(self, expected="idle"):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            motion = self.service.status(ALICE)["motion"]
+            if motion["state"] == expected:
+                return motion
+            time.sleep(0.005)
+        self.fail(f"motion never reached {expected}: {motion}")
+
     def test_duplicate_move_returns_same_reply_exactly_once(self):
         self.command("/api/new", level="beginner")
         first, body = self.command("/api/move", **{"from": "e2", "to": "e4"})
-        second = self.service.mutate("/api/move", body, ALICE)
-        self.assertEqual(first, second)
+        self.assertEqual(first["uciMoves"][0], "e2e4")
+        self.assertEqual(len(first["uciMoves"]), 2, "the digital game answers in the same request")
+        self.assertEqual(first["computer"]["uci"], first["uciMoves"][1])
+        self.assertFalse(first["board"])
+        self.assertEqual(self.service.mutate("/api/move", body, ALICE), first)
+        self.settled()
+        self.assertEqual(self.service.mutate("/api/move", body, ALICE), first)
         self.assertEqual(self.engine.calls, 1)
-        self.assertEqual(len(second["uciMoves"]), 2)
-        self.assertEqual(second["revision"], 2)
-
+        state = self.service.status(ALICE)
+        self.assertEqual(len(state["uciMoves"]), 2)
+        self.assertEqual(state["revision"], 2)
     def test_concurrent_retries_do_not_duplicate_engine_call(self):
         self.command("/api/new")
         state = self.service.status(ALICE)
@@ -72,8 +94,8 @@ class RemoteGameTests(unittest.TestCase):
         for thread in threads: thread.join()
         self.assertEqual(len(results), 4)
         self.assertTrue(all(x == results[0] for x in results))
+        self.settled()
         self.assertEqual(self.engine.calls, 1)
-
     def test_colliding_request_id_rejected_for_changed_body_or_owner(self):
         first, body = self.command("/api/new")
         for changed, owner in [({**body, "level": "advanced"}, ALICE), (body, BOB)]:
@@ -102,38 +124,70 @@ class RemoteGameTests(unittest.TestCase):
         self.command("/api/new", BOB)
         self.assertFalse(self.service.status(ALICE)["canControl"])
 
-    def test_failed_engine_and_illegal_moves_do_not_commit(self):
+    def test_illegal_moves_do_not_commit(self):
         self.command("/api/new")
         before = copy.deepcopy(self.service.record)
         with self.assertRaises(ApiError):
             self.command("/api/move", **{"from": "e2", "to": "e5"})
         self.assertEqual(self.service.record, before)
+
+    def test_a_failing_engine_refuses_the_digital_move_and_recovers(self):
+        self.command("/api/new")
+        before = copy.deepcopy(self.service.record)
         self.engine.fail = True
-        with self.assertRaises(ApiError) as caught:
+        with self.assertLogs(level="ERROR"), self.assertRaises(ApiError) as caught:
             self.command("/api/move", **{"from": "e2", "to": "e4"})
         self.assertEqual(caught.exception.code, "engine_failed")
-        self.assertEqual(self.service.record, before)
-        self.assertEqual(self.service.status(ALICE)["uciMoves"], [])
+        self.assertEqual(self.service.record, before, "nothing is committed")
+        self.assertFalse(self.service.status(ALICE)["engine"])
+        self.engine.fail = False
+        self.now[0] += 15
+        self.assertTrue(self.service.status(ALICE)["engine"])
+        response, _ = self.command("/api/move", **{"from": "e2", "to": "e4"})
+        self.assertEqual(len(response["uciMoves"]), 2)
 
+    def test_a_dead_engine_refuses_the_move_before_anything_is_committed(self):
+        self.command("/api/new")
+        before = copy.deepcopy(self.service.record)
+        self.service.player, self.service.engine_factory = None, mock.Mock(side_effect=OSError("gone"))
+        with self.assertLogs(level="ERROR"), self.assertRaises(ApiError) as caught:
+            self.command("/api/move", **{"from": "e2", "to": "e4"})
+        self.assertEqual(caught.exception.code, "engine_unavailable")
+        self.assertEqual(self.service.record, before)
     def test_undo_is_atomic_and_deduplicated(self):
         self.command("/api/new")
         self.command("/api/move", **{"from": "e2", "to": "e4"})
+        self.settled()
         response, body = self.command("/api/undo")
         self.assertEqual(response["uciMoves"], [])
         self.assertEqual(response["undone"], 2)
         self.assertEqual(self.service.mutate("/api/undo", body, ALICE), response)
-
     def test_state_and_deduplication_survive_restart(self):
         self.command("/api/new", level="advanced")
         response, body = self.command("/api/move", **{"from": "d2", "to": "d4"})
+        self.settled()
+        before = self.service.status(ALICE)
         self.service.close()
         self.service = GameService(self.path, lambda: self.engine, lambda: self.now[0], lease_seconds=60)
         actual = self.service.status(ALICE)
         for key in ["fen", "uciMoves", "sanMoves", "revision", "gameId", "level", "leaseExpiresAt"]:
-            self.assertEqual(actual[key], response[key])
+            self.assertEqual(actual[key], before[key])
         self.assertEqual(self.service.mutate("/api/move", body, ALICE), response)
         self.assertEqual(self.engine.calls, 1)
 
+    def test_a_restart_before_stockfish_replied_still_plays_the_reply(self):
+        self.command("/api/new")
+        self.service.close()
+        db = sqlite3.connect(self.path)
+        record = json.loads(db.execute("SELECT value FROM state").fetchone()[0])
+        record.update(board=True, uciMoves=["e2e4"], boardMoves=["e2e4"])
+        with db:
+            db.execute("UPDATE state SET value=?", (json.dumps(record),))
+        db.close()
+        self.service = GameService(self.path, lambda: self.engine, lambda: self.now[0], lease_seconds=60)
+        self.settled()
+        self.assertEqual(len(self.service.status(ALICE)["uciMoves"]), 2)
+        self.assertEqual(self.engine.calls, 1)
     def test_status_recovers_engine_after_startup_failure_with_throttling(self):
         self.service.close()
         attempts = []
@@ -206,312 +260,676 @@ class RemoteGameTests(unittest.TestCase):
 
 
 class RecordingDriver:
+    """Stands in for the gantry program, and writes down the stages as they happen."""
     name = "test"
     moves_pieces, needs_person = True, False
 
-    def __init__(self):
-        self.jobs, self.fail, self.gate = [], False, None
+    def __init__(self, events=None):
+        self.jobs, self.fail, self.gate, self.events = [], False, None, events if events is not None else []
 
     def execute(self, job):
+        self.events.append(("gantry", job["label"]))
         if self.gate:
             self.gate.wait(5)
         self.jobs.append(job)
         if self.fail:
-            raise RuntimeError("motor stalled")
+            raise RuntimeError("gantry jammed")
+
+
+class FakeCamera:
+    """Sees the board the last job promised, or whatever a test says, and writes down that it looked."""
+
+    def __init__(self, driver, events):
+        self.driver, self.events, self.seen, self.fail, self.photos = driver, events, None, False, 0
+
+    def observe(self):
+        self.photos += 1
+        job = self.driver.jobs[-1] if self.driver.jobs else None
+        self.events.append(("camera", job["label"] if job else None))
+        if self.fail:
+            raise OSError("camera unplugged")
+        if self.seen is not None:
+            return self.seen
+        return BoardObservation(frozenset(job["expect"] if job else chess.Board().piece_map()))
+
+
+class ScriptedEngine(FakeEngine):
+    """Replies from a list, writing down when it was asked."""
+
+    def __init__(self, events, replies=()):
+        super().__init__()
+        self.events, self.replies, self.gate = events, list(replies), None
+
+    def choose_move(self, board, level):
+        self.events.append(("stockfish", board.peek().uci()))
+        if self.gate:
+            self.gate.wait(5)
+        if self.replies:
+            self.calls += 1
+            return chess.Move.from_uci(self.replies.pop(0))
+        return super().choose_move(board, level)
 
 
 class QueueTestCase(unittest.TestCase):
+    camera_connected = False
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.path = Path(self.temp.name) / "state.sqlite3"
-        self.engine = FakeEngine()
-        self.driver = RecordingDriver()
+        self.events = []
+        self.engine = ScriptedEngine(self.events)
+        self.driver = RecordingDriver(self.events)
+        self.camera = FakeCamera(self.driver, self.events) if self.camera_connected else None
         self.service = self.start()
         self.seq = 0
 
-    def start(self):
-        return GameService(self.path, lambda: self.engine, lambda: 1000, lease_seconds=60, motion_driver=self.driver)
+    def start(self, driver=None):
+        return GameService(self.path, lambda: self.engine, lambda: 1000, lease_seconds=60,
+                           motion_driver=driver or self.driver, camera=self.camera)
 
     def tearDown(self):
         if self.driver.gate:
             self.driver.gate.set()
+        if self.engine.gate:
+            self.engine.gate.set()
         self.service.close()
         self.temp.cleanup()
 
     def command(self, route, player=ALICE, **fields):
+        if route == "/api/new":
+            fields.setdefault("board", True)  # Queue tests are about games played out on the board.
         state = self.service.status(player)
         self.seq += 1
         return self.service.mutate(route, {"requestId": "m-" + str(self.seq), "expectedGameId": state["gameId"],
                                            "expectedRevision": state["revision"], **fields}, player)
 
-    def settled(self, expected="idle"):
+    def move(self, source, target, **fields):
+        return self.command("/api/move", **{"from": source, "to": target, **fields})
+
+    def resolve(self, player=ALICE):
+        return self.service.mutate("/api/motion-resolve", {}, player)
+
+    def wait_for(self, predicate, what):
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             motion = self.service.status(ALICE)["motion"]
-            if motion["state"] == expected:
+            if predicate(motion):
                 return motion
             time.sleep(0.005)
-        self.fail(f"motion never reached {expected}: {motion}")
+        self.fail(f"never {what}: {motion}")
+
+    def settled(self, expected="idle"):
+        return self.wait_for(lambda m: m["state"] == expected, f"reached {expected}")
+
+    def moves(self):
+        return self.service.status(ALICE)["uciMoves"]
 
 
-class MotionQueueTests(QueueTestCase):
-    def test_human_and_engine_moves_are_signalled_in_order(self):
+class WebsitePipelineTests(QueueTestCase):
+    """Player, gantry, camera, Stockfish, gantry, camera, back to the player."""
+    camera_connected = True
+
+    def test_every_stage_runs_in_order_and_only_then_is_it_the_players_turn(self):
         self.command("/api/new")
-        reply = self.command("/api/move", **{"from": "e2", "to": "e4"})
-        self.assertEqual(self.settled()["mode"], "test")
-        self.assertEqual([job["label"] for job in self.driver.jobs], ["e2e4", reply["computer"]["uci"]])
-        self.assertEqual(self.driver.jobs[0]["steps"][0]["path"], [[4, 1], [4, 3]])
-
-    def test_reply_does_not_wait_for_the_pieces_and_reports_the_queue(self):
-        self.command("/api/new")
-        self.driver.gate = threading.Event()
-        reply = self.command("/api/move", **{"from": "e2", "to": "e4"})
-        self.assertEqual(reply["uciMoves"][0], "e2e4")
-        self.assertEqual(reply["motion"]["state"], "moving")
-        self.assertEqual(reply["motion"]["current"], "e2e4")
-        self.driver.gate.set()
+        reply = self.move("e2", "e4")
+        self.assertEqual(reply["uciMoves"], ["e2e4"], "Stockfish must not have moved yet")
+        self.assertEqual(reply["turn"], "b")
         self.settled()
+        played = self.moves()
+        self.assertEqual(len(played), 2)
+        self.assertEqual(self.events, [("gantry", "e2e4"), ("camera", "e2e4"), ("stockfish", "e2e4"),
+                                       ("gantry", played[1]), ("camera", played[1])])
+        self.assertEqual(self.service.status(ALICE)["turn"], "w")
 
-    def test_failure_stops_the_queue_and_blocks_moves_until_someone_checks_the_board(self):
+    def test_failed_engine_stops_with_the_players_move_safe_and_can_retry(self):
         self.command("/api/new")
-        self.driver.fail = True
+        self.engine.fail = True
         with self.assertLogs(level="ERROR"):
-            self.command("/api/move", **{"from": "e2", "to": "e4"})
+            self.move("e2", "e4")
             motion = self.settled("fault")
-        self.assertEqual(len(self.driver.jobs), 1)
-        self.assertEqual(motion["current"], "e2e4")
-        self.assertEqual(motion["pending"], 1)
-        self.assertNotIn("motor stalled", motion["error"])
-        revision = self.service.status(ALICE)["revision"]
+        self.assertIn("Stockfish", motion["error"])
+        self.assertEqual(self.moves(), ["e2e4"])
         with self.assertRaises(ApiError) as caught:
-            self.command("/api/move", **{"from": "d2", "to": "d4"})
+            self.command("/api/undo")
         self.assertEqual(caught.exception.code, "board_fault")
-        self.assertEqual(self.service.status(ALICE)["revision"], revision)
-        with self.assertRaises(ApiError) as caught:
-            self.service.mutate("/api/motion-resolve", {}, BOB)
-        self.assertEqual(caught.exception.code, "board_busy")
-        self.driver.fail = False
-        self.assertEqual(self.service.mutate("/api/motion-resolve", {}, ALICE)["motion"]["state"], "idle")
-        self.assertEqual(len(self.driver.jobs), 1)
-        self.command("/api/move", **{"from": "d2", "to": "d4"})
+        self.engine.fail = False
+        self.resolve()
         self.settled()
-        self.assertEqual(len(self.driver.jobs), 3)
+        self.assertEqual(len(self.moves()), 2)
 
-    def test_resolving_without_a_fault_cannot_drop_queued_moves(self):
+    def test_the_gantry_gets_the_right_data(self):
+        self.engine.replies = ["d7d5"]
+        self.command("/api/new")
+        self.move("e2", "e4")
+        self.settled()
+        human, stockfish = self.driver.jobs
+        self.assertEqual(human["label"], "e2e4")
+        self.assertEqual(human["steps"], [{"op": "carry", "piece": "P", "from": "e2", "to": "e4", "path": [[4.0, 1.0], [4.0, 3.0]]}])
+        board = chess.Board()
+        board.push_uci("e2e4")
+        self.assertEqual(set(human["expect"]), occupied_squares(board))
+        self.assertEqual(stockfish["steps"], [{"op": "carry", "piece": "p", "from": "d7", "to": "d5", "path": [[3.0, 6.0], [3.0, 4.0]]}])
+        board.push_uci("d7d5")
+        self.assertEqual(set(stockfish["expect"]), occupied_squares(board))
+        self.engine.replies = ["d8d5"]
+        self.move("e4", "d5")
+        self.settled()
+        capture, recapture = self.driver.jobs[2:]
+        self.assertEqual([(s["piece"], s["from"], s["to"]) for s in capture["steps"]], [("p", "d5", "b:0"), ("P", "e4", "d5")])
+        self.assertEqual([(s["piece"], s["from"], s["to"]) for s in recapture["steps"]], [("P", "d5", "w:0"), ("q", "d8", "d5")])
+
+    def test_the_player_cannot_move_at_any_stage_until_the_turn_comes_back(self):
         self.command("/api/new")
         self.driver.gate = threading.Event()
-        self.command("/api/move", **{"from": "e2", "to": "e4"})
-        self.service.mutate("/api/motion-resolve", {}, ALICE)
+        self.move("e2", "e4")
+        self.assertEqual(self.wait_for(lambda m: m["current"] == "e2e4", "started")["stage"], "gantry")
+        for attempt in (lambda: self.move("d2", "d4"), lambda: self.command("/api/undo"), lambda: self.command("/api/new")):
+            with self.assertRaises(ApiError) as caught:
+                attempt()
+            self.assertEqual(caught.exception.code, "board_moving")
+        self.engine.gate = threading.Event()
         self.driver.gate.set()
+        self.driver.gate = None
+        self.assertEqual(self.wait_for(lambda m: m["stage"] == "stockfish", "thinking")["state"], "moving")
+        self.assertEqual(self.moves(), ["e2e4"])
+        with self.assertRaises(ApiError) as caught:
+            self.move("d2", "d4")
+        self.assertEqual(caught.exception.code, "board_moving")
+        self.engine.gate.set()
         self.settled()
-        self.assertEqual(len(self.driver.jobs), 2)
+        self.move("d2", "d4")
+        self.settled()
+        self.assertEqual(len(self.moves()), 4)
 
-    def test_restart_during_a_job_never_assumes_it_finished(self):
+    def test_camera_rejecting_the_players_move_stops_before_stockfish(self):
+        self.command("/api/new")
+        self.camera.seen = BoardObservation(frozenset({"a1"}))
+        with self.assertLogs(level="WARNING"):
+            self.move("e2", "e4")
+            motion = self.settled("fault")
+        self.assertIn("camera", motion["error"])
+        self.assertEqual(self.engine.calls, 0)
+        self.assertEqual(self.moves(), ["e2e4"])
+        with self.assertRaises(ApiError) as caught:
+            self.move("d2", "d4")
+        self.assertEqual(caught.exception.code, "board_fault")
+        # Someone fixes the pieces and confirms: the game carries on from where it stopped.
+        self.camera.seen = None
+        self.resolve()
+        self.settled()
+        self.assertEqual(self.engine.calls, 1)
+        self.assertEqual(len(self.moves()), 2)
+
+    def test_camera_rejecting_stockfishs_move_does_not_give_the_turn_back(self):
+        self.command("/api/new")
+        self.engine.replies = ["e7e5"]
+        real = self.camera.observe
+        def observe():
+            seen = real()
+            return BoardObservation(frozenset({"a1"})) if len(self.driver.jobs) == 2 else seen
+        self.camera.observe = observe
+        with self.assertLogs(level="WARNING"):
+            self.move("e2", "e4")
+            motion = self.settled("fault")
+        self.assertEqual(motion["current"], "e7e5")
+        self.assertEqual(self.moves(), ["e2e4", "e7e5"])
+        with self.assertRaises(ApiError) as caught:
+            self.move("d2", "d4")
+        self.assertEqual(caught.exception.code, "board_fault")
+        self.camera.observe = real
+        self.resolve()
+        self.settled()
+        self.move("d2", "d4")
+        self.settled()
+        self.assertEqual(len(self.moves()), 4)
+
+    def test_a_game_ended_by_the_players_move_never_asks_stockfish(self):
+        self.engine.replies = ["e7e5", "b8c6", "a7a6"]
+        self.command("/api/new")
+        for source, target in [("e2", "e4"), ("f1", "c4"), ("d1", "h5")]:
+            self.move(source, target)
+            self.settled()
+        asked = self.engine.calls
+        reply = self.move("h5", "f7")
+        self.assertTrue(reply["gameOver"])
+        self.settled()
+        self.assertEqual(self.engine.calls, asked)
+        self.assertEqual(self.driver.jobs[-1]["label"], "h5f7")
+
+    def test_stockfish_mating_the_player_still_finishes_on_the_board(self):
+        self.engine.replies = ["e7e5", "d8h4"]
+        self.command("/api/new")
+        self.move("f2", "f3")
+        self.settled()
+        self.move("g2", "g4")
+        self.settled()
+        state = self.service.status(ALICE)
+        self.assertTrue(state["gameOver"])
+        self.assertEqual(state["outcome"]["winner"], "b")
+        self.assertEqual(self.driver.jobs[-1]["label"], "d8h4")
+
+    def test_takeback_runs_through_the_gantry_and_camera_with_no_new_reply(self):
+        self.command("/api/new")
+        self.move("e2", "e4")
+        self.settled()
+        reply = self.moves()[1]
+        asked, self.events[:] = self.engine.calls, []
+        self.command("/api/undo")
+        self.settled()
+        self.assertEqual(self.events, [("gantry", "undo " + reply), ("camera", "undo " + reply), ("gantry", "undo e2e4"), ("camera", "undo e2e4")])
+        self.assertEqual(self.engine.calls, asked)
+        self.assertEqual(self.moves(), [])
+
+    def test_a_move_read_off_the_board_skips_the_gantry_for_that_move_only(self):
+        self.command("/api/new")
+        self.move("g1", "f3", fromBoard=True)
+        self.settled()
+        self.assertEqual(self.events[0], ("stockfish", "g1f3"))
+        self.assertEqual(len(self.driver.jobs), 1)
+
+    def test_a_restart_during_the_gantry_never_assumes_it_finished(self):
         self.command("/api/new")
         self.driver.gate = threading.Event()
-        self.command("/api/move", **{"from": "e2", "to": "e4"})
-        deadline = time.monotonic() + 5
-        while self.service.db.execute("SELECT COUNT(*) FROM motion_jobs WHERE status='running'").fetchone()[0] == 0:
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(0.005)
+        self.move("e2", "e4")
+        self.wait_for(lambda m: self.events, "started")
         self.service.close()
         self.service = self.start()
         motion = self.service.status(ALICE)["motion"]
         self.assertEqual(motion["state"], "fault")
         self.assertIn("restarted", motion["error"])
 
-    def test_takeback_and_new_game_move_the_pieces_back(self):
+
+class NothingConnectedTests(QueueTestCase):
+    """The Pi today: no gantry program and no camera. The game must still work and log the data."""
+
+    def start(self, driver=None):
+        return GameService(self.path, lambda: self.engine, lambda: 1000, lease_seconds=60, motion_driver=driver)
+
+    def test_the_game_runs_end_to_end_and_logs_what_it_would_send(self):
         self.command("/api/new")
-        reply = self.command("/api/move", **{"from": "e2", "to": "e4"})
+        with self.assertLogs(level="INFO") as logged:
+            self.move("e2", "e4")
+            self.settled()
+        output = "\n".join(logged.output)
+        self.assertIn('"from": "e2", "to": "e4"', output)
+        self.assertIn("gantry: not connected", output)
+        self.assertIn("camera: skipped", output)
+        self.assertIn("stockfish: played", output)
+        self.assertIn("back to the player", output)
+        state = self.service.status(ALICE)
+        self.assertEqual(len(state["uciMoves"]), 2)
+        self.assertEqual(state["motion"]["mode"], "simulated")
+        self.assertEqual(state["motion"]["state"], "idle")
+        self.assertFalse(state["motion"]["camera"])
+
+    def test_a_connected_camera_is_not_consulted_while_the_gantry_cannot_have_moved_anything(self):
+        self.service.close()
+        camera = FakeCamera(self.driver, self.events)
+        self.service = GameService(self.path, lambda: self.engine, lambda: 1000, lease_seconds=60, camera=camera)
+        self.command("/api/new")
+        self.move("e2", "e4")
         self.settled()
-        self.command("/api/undo")
+        self.assertEqual(camera.photos, 0)
+        self.assertEqual(len(self.moves()), 2)
+
+
+class GantryFailureTests(QueueTestCase):
+    def test_gantry_failure_stops_before_stockfish_and_blocks_moves_until_someone_checks(self):
+        self.command("/api/new")
+        self.driver.fail = True
+        with self.assertLogs(level="ERROR"):
+            self.move("e2", "e4")
+            motion = self.settled("fault")
+        self.assertEqual((motion["current"], motion["pending"]), ("e2e4", 0))
+        self.assertNotIn("jammed", motion["error"])
+        self.assertEqual(self.engine.calls, 0)
+        revision = self.service.status(ALICE)["revision"]
+        with self.assertRaises(ApiError) as caught:
+            self.move("d2", "d4")
+        self.assertEqual(caught.exception.code, "board_fault")
+        self.assertEqual(self.service.status(ALICE)["revision"], revision)
+        with self.assertRaises(ApiError) as caught:
+            self.resolve(BOB)
+        self.assertEqual(caught.exception.code, "board_busy")
+        self.driver.fail = False
+        self.resolve()
         self.settled()
-        self.assertEqual([job["label"] for job in self.driver.jobs[2:]], ["undo " + reply["computer"]["uci"], "undo e2e4"])
-        self.driver.jobs.clear()
+        self.assertEqual(self.engine.calls, 1)
+        self.assertEqual(len(self.moves()), 2)
+
+    def test_resolving_without_a_fault_changes_nothing(self):
+        self.command("/api/new")
+        self.driver.gate = threading.Event()
+        self.move("e2", "e4")
+        self.resolve()
+        self.driver.gate.set()
+        self.settled()
+        self.assertEqual(len(self.driver.jobs), 2)
+
+    def test_new_game_after_moves_sends_the_pieces_home_and_on_an_untouched_board_sends_nothing(self):
         self.command("/api/new")
         self.settled()
         self.assertEqual(self.driver.jobs, [])
-        self.command("/api/move", **{"from": "e2", "to": "e4"})
+        self.move("e2", "e4")
         self.settled()
         self.driver.jobs.clear()
         self.command("/api/new")
         self.settled()
         self.assertEqual([job["label"] for job in self.driver.jobs], ["reset"])
 
+    def test_unreadable_saved_step_stops_the_queue_with_a_message_instead_of_hanging(self):
+        self.command("/api/new")
+        board = self.service.board
+        with board.ready:
+            with board.db:
+                board.db.execute("INSERT INTO motion_jobs (label, steps, expect, status) VALUES ('bad', 'not json', '[]', 'pending')")
+            board.ready.notify()
+        with self.assertLogs(level="ERROR"):
+            motion = self.settled("fault")
+        self.assertIn("could not be read", motion["error"])
+        self.assertTrue(board.thread.is_alive())
+        self.assertEqual(self.resolve()["motion"]["state"], "idle")
+        self.move("e2", "e4")
+        self.settled()
+        self.assertEqual(len(self.driver.jobs), 2)
 
-class FakeCamera:
-    """Sees whatever a test tells it to, or the true position if `follow` is set."""
+    def test_worker_survives_an_unexpected_error(self):
+        board = self.service.board
+        real, calls = board._next_job, []
+        def flaky():
+            calls.append(1)
+            if len(calls) == 1:
+                raise sqlite3.OperationalError("disk full")
+            return real()
+        board._next_job = flaky
+        self.command("/api/new")
+        with self.assertLogs(level="ERROR"), board.ready:
+            board.ready.notify()
+            board.ready.wait(0.2)
+        self.assertTrue(board.thread.is_alive())
+        self.move("e2", "e4")
+        self.settled()
+        self.assertEqual(len(self.driver.jobs), 2)
 
-    def __init__(self):
-        self.next, self.follow, self.fail, self.photos = None, None, False, 0
+    def test_server_id_survives_a_restart_but_differs_between_databases(self):
+        first = self.service.status(ALICE)["serverId"]
+        self.service.close()
+        self.service = self.start()
+        self.assertEqual(self.service.status(ALICE)["serverId"], first)
+        with tempfile.TemporaryDirectory() as other:
+            fresh = GameService(Path(other) / "state.sqlite3", lambda: self.engine, lambda: 1000)
+            try:
+                self.assertNotEqual(fresh.status(ALICE)["serverId"], first)
+            finally:
+                fresh.close()
 
-    def observe(self):
-        self.photos += 1
-        if self.fail:
-            raise OSError("camera unplugged")
-        return self.next if self.next else BoardObservation(frozenset(self.follow()))
 
-
-class BoardSyncTests(QueueTestCase):
-    """The pi-only flow: a person moves the pieces and the camera checks the result."""
+class PersonMovesPiecesTests(QueueTestCase):
+    """CHESS_BOARD_MODE=manual: the same order, with a person in the gantry's place."""
+    camera_connected = True
 
     def start(self, driver=None):
-        self.camera = getattr(self, "camera", None) or FakeCamera()
+        self.manual = ManualDriver()
         return GameService(self.path, lambda: self.engine, lambda: 1000, lease_seconds=60,
-                           motion_driver=driver or ManualDriver(), camera=self.camera)
+                           motion_driver=driver or self.manual, camera=self.camera)
+
+    def setUp(self):
+        super().setUp()
+        self.camera = FakeCamera(self.driver, self.events)
+        self.service.board.camera = self.camera
+        self.true_board = lambda: BoardObservation(frozenset(self.driver.jobs and () or occupied_squares(self.service.game.board)))
+        self.camera.observe = lambda: self.seen_override or self.true_board()
+        self.seen_override = None
 
     def confirm(self, **body):
         return self.service.mutate("/api/board-confirm", body, ALICE)
 
     def waiting_on(self, label):
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            motion = self.service.status(ALICE)["motion"]
-            if motion["state"] == "waiting" and motion["current"] == label:
-                return motion
-            time.sleep(0.005)
-        self.fail(f"never waited on {label}: {motion}")
+        return self.wait_for(lambda m: m["state"] == "waiting" and m["current"] == label, f"waited on {label}")
 
-    def after(self, *moves):
-        board = chess.Board()
-        for uci in moves:
-            board.push_uci(uci)
-        return occupied_squares(board)
-
-    def test_queue_waits_for_a_person_and_tells_them_what_to_do(self):
+    def new_game(self):
         self.command("/api/new")
-        self.camera.follow = lambda: self.after("e2e4")
-        reply = self.command("/api/move", **{"from": "e2", "to": "e4"})
-        motion = self.waiting_on("e2e4")
-        self.assertEqual(motion["instructions"], ["Move the white pawn from e2 to e4."])
-        self.assertEqual(motion["pending"], 1)
-        self.assertEqual(self.camera.photos, 0)
+        self.waiting_on("reset")
+        self.confirm(override=True)
+        self.settled()
+
+    def reply_uci(self):
+        deadline = time.monotonic() + 5
+        while len(self.moves()) < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        return self.moves()[1]
+
+    def test_new_game_checks_the_starting_board_first(self):
+        self.seen_override = BoardObservation(frozenset({"a1"}))
+        self.command("/api/new")
+        self.assertEqual(self.waiting_on("reset")["instructions"], ["Set up the standard starting position."])
         self.confirm()
-        reply_uci = reply["computer"]["uci"]
-        motion = self.waiting_on(reply_uci)
-        self.assertEqual(self.camera.photos, 1)
-        self.camera.follow = lambda: self.after("e2e4", reply_uci)
+        motion = self.wait_for(lambda m: m["mismatch"], "reported a mismatch")
+        self.assertEqual(motion["state"], "waiting")
+        self.seen_override = None
         self.confirm()
         self.settled()
 
-    def test_wrong_board_keeps_waiting_and_says_what_is_wrong(self):
-        self.command("/api/new")
-        self.camera.follow = lambda: self.after()
-        self.command("/api/move", **{"from": "e2", "to": "e4"})
-        self.waiting_on("e2e4")
+    def test_stockfish_waits_until_the_person_has_moved_the_players_piece(self):
+        self.new_game()
+        reply = self.move("e2", "e4")
+        self.assertEqual(reply["uciMoves"], ["e2e4"])
+        self.assertEqual(reply["motion"]["state"], "waiting")
+        self.assertEqual(reply["motion"]["instructions"], ["Move the white pawn from e2 to e4."])
+        self.assertIsInstance(reply["motion"]["jobId"], int)
+        time.sleep(0.05)
+        self.assertEqual(self.engine.calls, 0)
         self.confirm()
-        deadline = time.monotonic() + 5
-        while not self.service.status(ALICE)["motion"]["mismatch"]:
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(0.005)
-        motion = self.service.status(ALICE)["motion"]
-        self.assertEqual(motion["state"], "waiting")
-        self.assertEqual(motion["mismatch"], {"missing": ["e4"], "extra": ["e2"], "uncertain": []})
-        self.camera.follow = lambda: self.after("e2e4")
+        answer = self.reply_uci()
+        self.waiting_on(answer)
+        self.assertEqual(self.engine.calls, 1)
         self.confirm()
-        self.waiting_on(self.service.record["uciMoves"][1])
+        self.settled()
 
-    def test_uncertain_photo_and_broken_camera_ask_again_instead_of_failing(self):
-        self.command("/api/new")
-        self.camera.next = BoardObservation(frozenset(), ("d4",))
-        self.command("/api/move", **{"from": "e2", "to": "e4"})
+    def test_a_press_for_an_earlier_step_cannot_confirm_the_next_one(self):
+        self.new_game()
+        self.move("e2", "e4")
+        first = self.waiting_on("e2e4")["jobId"]
+        self.confirm(jobId=first)
+        answer = self.reply_uci()
+        second = self.waiting_on(answer)["jobId"]
+        self.assertNotEqual(first, second)
+        self.confirm(jobId=first)
+        time.sleep(0.1)
+        self.assertEqual(self.waiting_on(answer)["jobId"], second)
+        self.confirm(jobId=second)
+        self.settled()
+
+    def test_override_accepts_the_board_without_the_camera(self):
+        self.new_game()
+        self.seen_override = BoardObservation(frozenset({"a1"}))
+        self.move("e2", "e4")
+        self.waiting_on("e2e4")
+        self.confirm(override=True)
+        self.waiting_on(self.reply_uci())
+
+    def test_wrong_board_and_broken_camera_ask_again_instead_of_failing(self):
+        self.new_game()
+        self.seen_override = BoardObservation(frozenset(), ("d4",))
+        self.move("e2", "e4")
         self.waiting_on("e2e4")
         self.confirm()
-        deadline = time.monotonic() + 5
-        while not self.service.status(ALICE)["motion"]["mismatch"]:
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(0.005)
-        self.assertEqual(self.service.status(ALICE)["motion"]["mismatch"]["uncertain"], ["d4"])
-        self.camera.fail = True
-        before = self.camera.photos
+        self.assertEqual(self.wait_for(lambda m: m["mismatch"], "reported")["mismatch"]["uncertain"], ["d4"])
+        def broken():
+            raise OSError("camera unplugged")
+        self.camera.observe = broken
         with self.assertLogs(level="ERROR"):
             self.confirm()
-            deadline = time.monotonic() + 5
-            while self.camera.photos == before or not self.service.status(ALICE)["motion"]["mismatch"].get("error"):
-                self.assertLess(time.monotonic(), deadline)
-                time.sleep(0.005)
-        motion = self.service.status(ALICE)["motion"]
+            motion = self.wait_for(lambda m: (m["mismatch"] or {}).get("error"), "reported the camera")
         self.assertEqual(motion["state"], "waiting")
         self.assertNotIn("unplugged", motion["mismatch"]["error"])
 
-    def test_override_accepts_the_board_without_the_camera(self):
-        self.command("/api/new")
-        self.camera.next = BoardObservation(frozenset(), ("d4",))
-        reply = self.command("/api/move", **{"from": "e2", "to": "e4"})
-        self.waiting_on("e2e4")
-        self.confirm(override=True)
-        self.waiting_on(reply["computer"]["uci"])
-        self.assertEqual(self.camera.photos, 0)
-
-    def test_without_a_camera_the_persons_word_is_enough(self):
-        self.service.close()
-        self.camera = None
-        self.service = GameService(self.path, lambda: self.engine, lambda: 1000, lease_seconds=60, motion_driver=ManualDriver())
-        self.command("/api/new")
-        reply = self.command("/api/move", **{"from": "e2", "to": "e4"})
-        self.assertFalse(reply["motion"]["camera"])
-        self.waiting_on("e2e4")
-        self.confirm()
-        self.waiting_on(reply["computer"]["uci"])
-        self.confirm()
-        self.settled()
-
     def test_restart_while_waiting_asks_the_person_again(self):
-        self.command("/api/new")
-        self.command("/api/move", **{"from": "e2", "to": "e4"})
+        self.new_game()
+        self.move("e2", "e4")
         self.waiting_on("e2e4")
         self.service.close()
         self.service = self.start()
         self.assertEqual(self.waiting_on("e2e4")["instructions"], ["Move the white pawn from e2 to e4."])
 
-    def test_motor_job_checked_by_camera_stops_on_a_wrong_board(self):
-        self.service.close()
-        self.service = self.start(self.driver)
+    def test_new_game_clears_steps_nobody_has_done_yet(self):
+        self.new_game()
+        self.move("e2", "e4")
+        self.waiting_on("e2e4")
         self.command("/api/new")
-        self.camera.follow = lambda: self.after()
-        with self.assertLogs(level="WARNING"):
-            self.command("/api/move", **{"from": "e2", "to": "e4"})
-            motion = self.settled("fault")
-        self.assertEqual(motion["current"], "e2e4")
-        self.assertIn("camera", motion["error"])
-
-    def test_motor_job_checked_by_camera_continues_on_the_right_board(self):
-        self.service.close()
-        self.service = self.start(self.driver)
-        self.command("/api/new")
-        self.camera.follow = lambda: self.driver.jobs[-1]["expect"]
-        self.command("/api/move", **{"from": "e2", "to": "e4"})
+        motion = self.waiting_on("reset")
+        self.assertEqual((motion["pending"], motion["instructions"]), (0, ["Set up the standard starting position."]))
+        self.confirm(override=True)
         self.settled()
-        self.assertEqual(len(self.driver.jobs), 2)
-        self.assertEqual(self.camera.photos, 2)
+        self.assertEqual(self.moves(), [])
+
+    def test_a_press_right_after_a_new_game_never_strands_the_queue(self):
+        for _ in range(25):
+            self.new_game()
+            self.move("e2", "e4")
+            self.waiting_on("e2e4")
+            self.command("/api/new")
+            self.confirm(override=True)
+            self.settled()
+
+
+class DigitalGameTests(QueueTestCase):
+    """The regular website game: Stockfish answers in the request, and the board hardware is never touched."""
+    camera_connected = True
+
+    def test_nothing_physical_happens_and_the_reply_comes_back_at_once(self):
+        self.command("/api/new", board=False)
+        reply = self.move("e2", "e4")
+        self.assertFalse(reply["board"])
+        self.assertEqual(len(reply["uciMoves"]), 2)
+        self.assertEqual(reply["computer"]["uci"], reply["uciMoves"][1])
+        self.assertEqual(reply["turn"], "w")
+        self.assertEqual(reply["motion"]["state"], "idle")
+        time.sleep(0.05)
+        self.assertEqual([event for event in self.events if event[0] != "stockfish"], [])
+        self.assertEqual(self.driver.jobs, [])
+        self.assertEqual(self.camera.photos, 0)
+        self.command("/api/undo")
+        self.command("/api/new", board=False)
+        time.sleep(0.05)
+        self.assertEqual(self.driver.jobs, [], "takebacks and new games move nothing either")
+
+    def test_a_stopped_board_does_not_stop_the_digital_game_but_does_stop_board_games(self):
+        self.command("/api/new")
+        self.driver.fail = True
+        with self.assertLogs(level="ERROR"):
+            self.move("e2", "e4")
+            self.settled("fault")
+        self.command("/api/new", board=False)
+        self.assertEqual(len(self.move("d2", "d4")["uciMoves"]), 2)
+        self.assertEqual(self.service.status(ALICE)["motion"]["state"], "fault", "the hardware still needs checking")
+        with self.assertRaises(ApiError) as caught:
+            self.command("/api/new", board=True)
+        self.assertEqual(caught.exception.code, "board_fault")
+        self.driver.fail = False
+        self.resolve()
+        self.command("/api/new", board=True)
+        self.settled()
+
+    def test_a_board_game_after_digital_games_resets_from_where_the_pieces_really_are(self):
+        self.engine.replies = ["e7e5"]
+        self.command("/api/new")
+        self.move("e2", "e4")
+        self.settled()
+        self.assertEqual(self.moves(), ["e2e4", "e7e5"])
+        self.command("/api/new", board=False)
+        self.engine.replies = ["g8f6", "b8c6"]
+        self.move("g1", "f3")
+        self.move("b1", "c3")
+        self.assertEqual(len(self.moves()), 4)
+        self.driver.jobs.clear()
+        self.command("/api/new", board=True)
+        self.settled()
+        reset, = self.driver.jobs
+        self.assertEqual(reset["label"], "reset")
+        moved_from = {step["from"] for step in reset["steps"] if ":" not in step["from"]}
+        self.assertEqual(moved_from, {"e4", "e5"}, "only the pieces the board game moved go home; the digital knights never left")
+
+    def test_reading_the_board_is_only_for_board_games(self):
+        self.command("/api/new", board=False)
+        with self.assertRaises(ApiError) as caught:
+            self.service.mutate("/api/board-scan", {}, ALICE)
+        self.assertEqual(caught.exception.code, "not_board_game")
+
+    def test_a_game_saved_before_the_choice_existed_is_a_board_game(self):
+        self.service.close()
+        db = sqlite3.connect(self.path)
+        record = json.loads(db.execute("SELECT value FROM state").fetchone()[0])
+        for key in ("board", "boardMoves"):
+            record.pop(key, None)
+        record.update(started=True, uciMoves=["e2e4"])
+        with db:
+            db.execute("UPDATE state SET value=?", (json.dumps(record),))
+        db.close()
+        self.service = self.start()
+        self.assertTrue(self.service.status(ALICE)["board"])
+        self.settled()
+        self.assertEqual(len(self.moves()), 2)
+        self.assertEqual(self.driver.jobs[-1]["label"], self.moves()[1])
+
+
+class GantryPlaceholderTests(QueueTestCase):
+    """CHESS_GANTRY=arduino: the Pi-to-Arduino driver is not written yet, and says so instead of pretending."""
+
+    def start(self, driver=None):
+        settings = {"CHESS_MOTION_COMMAND": "", "CHESS_GANTRY": "arduino", "CHESS_GANTRY_PORT": "/dev/ttyUSB7", "CHESS_GANTRY_BAUD": "9600"}
+        with mock.patch.dict(os.environ, settings):
+            self.gantry = driver_from_env()
+        return GameService(self.path, lambda: self.engine, lambda: 1000, lease_seconds=60, motion_driver=driver or self.gantry)
+
+    def test_the_placeholder_is_selected_from_the_environment(self):
+        self.assertIsInstance(self.gantry, ArduinoGantry)
+        self.assertEqual((self.gantry.port, self.gantry.baud), ("/dev/ttyUSB7", 9600))
+        self.assertEqual(self.service.status(ALICE)["motion"]["mode"], "arduino")
+
+    def test_a_board_game_stops_at_the_first_move_and_says_why(self):
+        self.command("/api/new")
+        with self.assertLogs(level="ERROR"):
+            self.move("e2", "e4")
+            motion = self.settled("fault")
+        self.assertEqual(motion["error"], NOT_DONE)
+        self.assertEqual(self.engine.calls, 0)
+        self.assertEqual(self.moves(), ["e2e4"])
+
+    def test_the_digital_game_does_not_care(self):
+        self.command("/api/new", board=False)
+        self.assertEqual(len(self.move("e2", "e4")["uciMoves"]), 2)
+
+
+class BoardScanTests(QueueTestCase):
+    camera_connected = True
 
     def scan(self):
         return self.service.mutate("/api/board-scan", {}, ALICE)
 
+    def looks_like(self, *moves):
+        board = chess.Board()
+        for uci in moves:
+            board.push_uci(uci)
+        self.camera.seen = BoardObservation(frozenset(occupied_squares(board)))
+
     def test_scan_finds_the_move_and_commits_nothing(self):
         self.command("/api/new")
-        self.camera.follow = lambda: self.after("g1f3")
+        self.settled()
+        self.looks_like("g1f3")
         result = self.scan()
-        self.assertEqual(result["status"], "matched")
-        self.assertEqual(result["candidates"][0]["uci"], "g1f3")
-        self.assertEqual(result["candidates"][0]["san"], "Nf3")
-        self.assertEqual(self.service.status(ALICE)["uciMoves"], [])
-
-    def test_a_move_read_off_the_board_only_queues_the_reply(self):
-        self.command("/api/new")
-        reply = self.command("/api/move", fromBoard=True, **{"from": "g1", "to": "f3"})
-        self.assertEqual(reply["motion"]["pending"] + (reply["motion"]["state"] == "waiting"), 1)
-        motion = self.waiting_on(reply["computer"]["uci"])
-        self.assertEqual(motion["pending"], 0)
+        self.assertEqual((result["status"], result["candidates"][0]["san"]), ("matched", "Nf3"))
+        self.assertEqual(self.moves(), [])
 
     def test_scan_reports_nothing_new_and_impossible_boards(self):
         self.command("/api/new")
-        self.camera.follow = lambda: self.after()
+        self.settled()
+        self.looks_like()
         self.assertEqual(self.scan()["status"], "unchanged")
-        self.camera.follow = lambda: self.after() - {"a1"}
+        self.camera.seen = BoardObservation(frozenset(occupied_squares(chess.Board()) - {"a1"}))
         result = self.scan()
         self.assertEqual((result["status"], result["missing"]), ("no_match", ["a1"]))
-        self.camera.next = BoardObservation(frozenset(), ("a1",))
+        self.camera.seen = BoardObservation(frozenset(), ("a1",))
         self.assertEqual(self.scan()["status"], "uncertain")
 
     def test_scan_refuses_while_the_board_is_busy_or_unavailable(self):
@@ -519,11 +937,14 @@ class BoardSyncTests(QueueTestCase):
             self.scan()
         self.assertEqual(caught.exception.code, "not_your_turn")
         self.command("/api/new")
-        self.command("/api/move", **{"from": "e2", "to": "e4"})
-        self.waiting_on("e2e4")
+        self.settled()
+        self.driver.gate = threading.Event()
+        self.move("e2", "e4")
         with self.assertRaises(ApiError) as caught:
             self.scan()
         self.assertEqual(caught.exception.code, "board_moving")
+        self.driver.gate.set()
+        self.settled()
         self.service.close()
         self.service = GameService(self.path, lambda: self.engine, lambda: 1000, lease_seconds=60)
         with self.assertRaises(ApiError) as caught:
