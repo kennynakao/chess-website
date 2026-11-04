@@ -15,7 +15,7 @@ const html = fs.readFileSync(require.resolve('../play.html'),'utf8');
 for (const match of source.matchAll(/\$\('#([a-z][a-z0-9-]*)'\)/g)) assert(html.includes('id="'+match[1]+'"'), 'missing element '+match[1]);
 source=source.slice(0,source.indexOf('  // ----------------------------------------------------------------- boot'))+`
  renderBoard = renderAll = renderPlayers = renderControls = renderNewGamePanel = renderConnection = hideModal = toast = () => {};
- Sound.play = () => {};
+ Sound.play = (kind) => { app.lastSound = kind; };
  globalThis.app={Backend,state,applyRemoteState,startGame,requestEngineMove,reconnectPi,canInteract,canPremove,queuePremove,commitMove,takeback};
 })();`;
 vm.runInContext(source,context);
@@ -78,4 +78,24 @@ function response(body,status=200) { return {ok:status<400,status,json:async()=>
  a.applyRemoteState(snapshot([],11,{gameOver:true,outcome:{winner:null,result:'1/2-1/2',reason:'threefold repetition'}}));
  assert.equal(s.status,'over');assert.equal(s.result.reason,'threefold repetition');
  console.log('PASS Pi outcome remains authoritative even when local rules have not ended the game');
+ // Reads and clears the popup title, so each check only sees its own result.
+ const popup=()=>{const title=elements.get('#modal-title');const text=title.textContent;title.textContent=undefined;return text;};
+ assert.equal(popup(),undefined);
+ console.log('PASS loading a finished game does not announce a result to a viewer');
+ const lost=(rev)=>snapshot(['f2f3','e7e5','g2g4','d8h4'],rev,{gameOver:true,outcome:{winner:'b',result:'0-1',reason:'checkmate'}});
+ a.applyRemoteState(snapshot(['f2f3','e7e5'],12));
+ handler=async()=>response(lost(13));
+ await a.requestEngineMove(s.game.move('g2g4'));
+ assert.equal(s.status,'over');assert.equal(popup(),'You Lost');assert.equal(a.lastSound,'end');
+ console.log('PASS Stockfish mating on the Pi shows the result popup and end sound');
+ a.applyRemoteState(snapshot(['e2e4','e7e5','f1c4','b8c6','d1h5','a7a6'],14));
+ handler=async()=>response(snapshot(['e2e4','e7e5','f1c4','b8c6','d1h5','a7a6','h5f7'],15,{gameOver:true,outcome:{winner:'w',result:'1-0',reason:'checkmate'}}));
+ await a.requestEngineMove(s.game.move('h5f7'));
+ assert.equal(s.status,'over');assert.equal(popup(),'You Won!');assert.equal(a.lastSound,'win');
+ console.log('PASS mating Stockfish on the Pi shows the result popup and win sound');
+ a.applyRemoteState(snapshot(['f2f3','e7e5'],16));
+ handler=async(path)=>{if(path==='/api/status')return response(lost(17));throw new TypeError('network');};
+ await a.requestEngineMove(s.game.move('g2g4'));
+ assert.equal(s.status,'over');assert.equal(popup(),'You Lost');
+ console.log('PASS a game that ended while the reply was lost still shows the result popup');
 })().catch(err=>{console.error(err);process.exitCode=1;});

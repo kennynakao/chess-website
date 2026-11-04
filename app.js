@@ -772,7 +772,8 @@
     try {
       const res = await Backend.move(sqName(rec.move.from), sqName(rec.move.to), rec.move.promo || null);
       applyRemoteState(res, { preservePremove: true });
-      Sound.play(res.check ? 'check' : 'move');
+      if (state.status === 'over') announceResult();
+      else Sound.play(res.check ? 'check' : 'move');
       // Metadata is updated before a queued premove starts the next request.
       playPremove();
     } catch (err) {
@@ -782,7 +783,10 @@
       if (Backend.snapshot) applyRemoteState(Backend.snapshot);
       Backend.authenticated = authenticated; Backend.available = false;
       await reconnectPi({ force: true });
-      renderPlayers(); renderControls(); toast(err.message, 5000);
+      renderPlayers(); renderControls();
+      // The Pi may have committed a game-ending move even though its reply was lost.
+      if (state.status === 'over') announceResult();
+      else toast(err.message, 5000);
     }
   }
 
@@ -831,11 +835,14 @@
     el.promo.classList.add('hidden');
     el.confirm.classList.add('hidden');
     renderAll();
-    if (reason !== 'aborted') {
-      const youWon = state.mode !== 'friend' && winner === state.playerColor;
-      Sound.play(youWon ? 'win' : 'end');
-      showModal();
-    }
+    if (reason !== 'aborted') announceResult();
+  }
+
+  /** Result sound and popup, only for the player who just finished the game (not viewers or reloads). */
+  function announceResult() {
+    const youWon = state.mode !== 'friend' && state.result.winner === state.playerColor;
+    Sound.play(youWon ? 'win' : 'end');
+    showModal();
   }
 
   function showModal() {
