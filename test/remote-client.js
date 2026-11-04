@@ -98,4 +98,12 @@ function response(body,status=200) { return {ok:status<400,status,json:async()=>
  await a.requestEngineMove(s.game.move('g2g4'));
  assert.equal(s.status,'over');assert.equal(popup(),'You Lost');
  console.log('PASS a game that ended while the reply was lost still shows the result popup');
+ a.applyRemoteState(snapshot(['e2e4','e7e5'],18,{motion:{mode:'test',state:'moving',current:'e7e5',pending:0,error:null}}));
+ assert(a.canInteract());
+ a.applyRemoteState(snapshot(['e2e4','e7e5'],19,{motion:{mode:'test',state:'fault',current:'e7e5',pending:0,error:'stopped'}}));
+ assert.equal(a.canInteract(),false);
+ console.log('PASS moving pieces do not block play, but a stopped board does');
+ a.applyRemoteState(snapshot(['e2e4','e7e5'],20));
+ assert(a.canInteract());
+ console.log('PASS a Pi without movement support still plays normally');
 })().catch(err=>{console.error(err);process.exitCode=1;});

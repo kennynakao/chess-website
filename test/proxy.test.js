@@ -170,6 +170,16 @@ test('malformed and oversized JSON bodies fail before contacting the Pi', async 
   assert.equal(calls.length, 0);
 });
 
+test('the board fault confirmation reaches the Pi for a signed-in player only', async () => {
+  assert.equal((await request('motion-resolve')).status, 401);
+  assert.equal(calls.length, 0);
+  const cookie = await login();
+  mockReply(200, { ok: true, revision: 5, motion: { state: 'idle' } });
+  const reply = await request('motion-resolve', { headers: { cookie } });
+  assert.equal(reply.status, 200);
+  assert.equal(new URL(calls[0][0]).pathname, '/api/motion-resolve');
+});
+
 test('unsupported routes and methods cannot be relayed', async () => {
   assert.equal((await request('arbitrary')).status, 404);
   assert.equal((await request('move', { method: 'GET' })).status, 405);

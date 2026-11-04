@@ -24,12 +24,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import chess
+from backend.board_motion import SimulatedDriver, driver_from_env, plan_transition
 from backend.chess_game import ChessGame, DIFFICULTIES, PromotionRequired, StockfishPlayer
 
 MAX_BODY = 4096
 SESSION_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
 REQUEST_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
-ROUTES = {"/api/new", "/api/move", "/api/undo"}
+ROUTES = {"/api/new", "/api/move", "/api/undo", "/api/motion-resolve"}
 
 
 class ApiError(Exception):
@@ -41,7 +42,7 @@ class ApiError(Exception):
 class GameService:
     """Serialize changes; commit game and deduplication record atomically."""
     def __init__(self, database: str | Path, engine_factory=StockfishPlayer,
-                 clock=time.time, lease_seconds=3600):
+                 clock=time.time, lease_seconds=3600, motion_driver=None):
         self.lock = threading.RLock()
         self.clock, self.lease_seconds = clock, lease_seconds
         self.engine_factory = engine_factory
@@ -56,6 +57,7 @@ class GameService:
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, response TEXT NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS motion_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL, steps TEXT NOT NULL, status TEXT NOT NULL, error TEXT)")
         row = self.db.execute("SELECT value FROM state WHERE id=1").fetchone()
         self.record = json.loads(row[0]) if row else {
             "gameId": str(uuid.uuid4()), "revision": 0, "started": False,
@@ -66,6 +68,14 @@ class GameService:
             with self.db:
                 self.db.execute("INSERT INTO state VALUES(1,?)", (json.dumps(self.record),))
         self._connect_engine()
+        self.motion_driver = motion_driver or SimulatedDriver()
+        self.motion_ready = threading.Condition(self.lock)
+        self.closing = False
+        # A job cut off by a restart may have left a piece anywhere: never assume it finished.
+        with self.db:
+            self.db.execute("UPDATE motion_jobs SET status='failed', error='The Pi restarted while this move was running.' WHERE status='running'")
+        self.motion_thread = threading.Thread(target=self._run_motion, name="board-motion", daemon=True)
+        self.motion_thread.start()
 
     @staticmethod
     def _restore(record):
@@ -130,7 +140,66 @@ class GameService:
             "canControl": not self._owned(session, record, game),
             "occupied": self._owned(session, record, game),
             "leaseExpiresAt": record["leaseExpiresAt"],
+            "motion": self._motion_status(),
         }
+
+    def _motion_status(self):
+        rows = self.db.execute("SELECT label, status, error FROM motion_jobs ORDER BY id").fetchall()
+        failed = next((row for row in rows if row[1] == "failed"), None)
+        running = next((row for row in rows if row[1] == "running"), None)
+        return {
+            "mode": self.motion_driver.name,
+            "state": "fault" if failed else "moving" if rows else "idle",
+            "current": (failed or running or (rows[0] if rows else (None,)))[0],
+            "pending": sum(row[1] == "pending" for row in rows),
+            "error": failed[2] if failed else None,
+        }
+
+    def _run_motion(self):
+        """Perform queued jobs one at a time, without holding the lock while pieces move."""
+        while True:
+            with self.motion_ready:
+                while not self.closing and (job := self._next_motion_job()) is None:
+                    self.motion_ready.wait()
+                if self.closing:
+                    return
+                with self.db:
+                    self.db.execute("UPDATE motion_jobs SET status='running' WHERE id=?", (job["id"],))
+            logging.info("MOTION start job=%s label=%s driver=%s", job["id"], job["label"], self.motion_driver.name)
+            error = None
+            try:
+                self.motion_driver.execute(job)
+            except Exception as exc:
+                error = "The board could not finish this move."
+                logging.exception("MOTION failed job=%s label=%s", job["id"], job["label"])
+            with self.lock:
+                if self.closing:
+                    return
+                with self.db:
+                    if error:
+                        self.db.execute("UPDATE motion_jobs SET status='failed', error=? WHERE id=?", (error, job["id"]))
+                    else:
+                        self.db.execute("DELETE FROM motion_jobs WHERE id=?", (job["id"],))
+
+    def _next_motion_job(self):
+        # A failure halts everything behind it: later steps assume the earlier ones happened.
+        if self.db.execute("SELECT 1 FROM motion_jobs WHERE status='failed'").fetchone():
+            return None
+        row = self.db.execute("SELECT id, label, steps FROM motion_jobs WHERE status='pending' ORDER BY id").fetchone()
+        return {"id": row[0], "label": row[1], "steps": json.loads(row[2])} if row else None
+
+    def resolve_motion(self, session):
+        """Someone checked the board and it matches the screen, so the queue restarts from here."""
+        with self.motion_ready:
+            if self._owned(session):
+                raise ApiError(409, "Another player is controlling the board.", "board_busy", state=self._snapshot(session))
+            if self._motion_status()["state"] != "fault":
+                return self._snapshot(session)
+            with self.db:
+                self.db.execute("DELETE FROM motion_jobs WHERE status IN ('failed', 'pending')")
+            logging.info("MOTION resolved by the player; queue cleared")
+            self.motion_ready.notify()
+            return self._snapshot(session)
 
     def status(self, session):
         with self.lock:
@@ -142,6 +211,8 @@ class GameService:
             raise ApiError(400, "Missing or invalid player session.", "invalid_session")
         if route not in ROUTES:
             raise ApiError(404, "Unknown API route.", "not_found")
+        if route == "/api/motion-resolve":
+            return self.resolve_motion(session)
         request_id = body.get("requestId")
         if not isinstance(request_id, str) or not REQUEST_PATTERN.fullmatch(request_id):
             raise ApiError(400, "A valid requestId is required.", "invalid_request")
@@ -161,6 +232,8 @@ class GameService:
                 raise ApiError(409, "The game changed. Reload its current state.", "stale_state", state=self._snapshot(session))
             if self._owned(session):
                 raise ApiError(409, "Another player is controlling the board.", "board_busy", state=self._snapshot(session))
+            if self._motion_status()["state"] == "fault":
+                raise ApiError(409, "The physical board stopped. Check the pieces before moving again.", "board_fault", state=self._snapshot(session))
             candidate = copy.deepcopy(self.game)
             record = copy.deepcopy(self.record)
             extra = {}
@@ -216,17 +289,26 @@ class GameService:
             record.update(revision=record["revision"] + 1, started=candidate.started,
                           level=candidate.level, uciMoves=[m.uci() for m in candidate.board.move_stack],
                           owner=session, leaseExpiresAt=self.clock() + self.lease_seconds)
-            response = {**self._snapshot(session, record, candidate), **extra, "requestId": request_id}
+            jobs = plan_transition(self.record["uciMoves"], record["uciMoves"], new_game=route == "/api/new")
+            # The game and the signals it owes the board commit together, or not at all.
             with self.db:
                 self.db.execute("UPDATE state SET value=? WHERE id=1", (json.dumps(record),))
+                for job in jobs:
+                    self.db.execute("INSERT INTO motion_jobs (label, steps, status) VALUES (?,?,'pending')", (job["label"], json.dumps(job["steps"])))
+                response = {**self._snapshot(session, record, candidate), **extra, "requestId": request_id}
                 self.db.execute("INSERT INTO requests VALUES(?,?,?)", (request_id, fingerprint, json.dumps(response)))
             self.record, self.game = record, candidate
+            self.motion_ready.notify()
             logging.info("COMMIT route=%s request=%s game=%s revision=%s human=%s stockfish=%s fen=%s",
                          route, request_id, record["gameId"], record["revision"],
                          extra.get("human", {}).get("uci", "-"), (extra.get("computer") or {}).get("uci", "-"), candidate.board.fen())
             return response
 
     def close(self):
+        with self.motion_ready:
+            self.closing = True
+            self.motion_ready.notify()
+        self.motion_thread.join(timeout=1)
         with self.lock:
             if self.player:
                 self.player.close()
@@ -318,9 +400,9 @@ def main():
     path = Path(os.environ.get("CHESS_STATE_PATH", "~/.local/share/duen-chess/state.sqlite3")).expanduser().resolve()
     if path == REPO_ROOT or REPO_ROOT in path.parents:
         raise SystemExit("CHESS_STATE_PATH must be outside the source repository")
-    service = GameService(path)
+    service = GameService(path, motion_driver=driver_from_env())
     server = create_server(service, token, port=args.port)
-    logging.info("Pi API ready at http://127.0.0.1:%s; device=chessboard engine=%s", args.port, service.player is not None)
+    logging.info("Pi API ready at http://127.0.0.1:%s; device=chessboard engine=%s motion=%s", args.port, service.player is not None, service.motion_driver.name)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

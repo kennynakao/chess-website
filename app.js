@@ -32,7 +32,7 @@
 
   const Backend = {
     available: false, engine: false, authenticated: false, pending: false,
-    canControl: false, engineError: null, error: null, levels: [],
+    canControl: false, engineError: null, error: null, levels: [], motion: null,
     revision: 0, gameId: null, snapshot: null, probing: null,
     accept(data) {
       if (this.snapshot && data.revision < this.revision) return this.snapshot;
@@ -42,6 +42,7 @@
       this.engineError = data.engineError || null;
       this.levels = Array.isArray(data.levels) ? data.levels : [];
       this.canControl = data.canControl === true;
+      this.motion = data.motion || null;
       this.revision = data.revision;
       this.gameId = data.gameId;
       this.snapshot = data;
@@ -154,7 +155,7 @@
     modalSub: $('#modal-sub'), modalScore: $('#modal-score'), modalNameW: $('#modal-name-w'), modalNameB: $('#modal-name-b'),
     modalAvW: $('#modal-av-w'), modalAvB: $('#modal-av-b'), modalRematch: $('#modal-rematch'), modalNew: $('#modal-new'),
     soundToggle: $('#sound-toggle'),
-    connection: $('#connection-status'), reconnect: $('#reconnect-pi'),
+    connection: $('#connection-status'), reconnect: $('#reconnect-pi'), motionResolve: $('#motion-resolve'),
     access: $('#access-overlay'), accessForm: $('#access-form'), accessCode: $('#access-code'), accessError: $('#access-error'), accessSubmit: $('#access-submit'),
   };
 
@@ -516,8 +517,20 @@
       !Backend.available ? 'Pi offline — reconnecting. Your game is saved.' :
       !Backend.engine ? 'Pi connected — Stockfish unavailable' :
       Backend.canControl ? 'Connected to Raspberry Pi · Stockfish ready' : 'Watching the Pi · another player has control';
-    el.connection.textContent = message;
+    el.connection.textContent = Backend.available && motionText() ? `${message} · ${motionText()}` : message;
     el.reconnect.textContent = Backend.authenticated ? 'Reconnect' : 'Unlock';
+    el.motionResolve.classList.toggle('hidden', !(boardFaulted() && Backend.canControl));
+  }
+
+  const boardFaulted = () => !!Backend.motion && Backend.motion.state === 'fault';
+
+  /** What the physical board is doing; empty when there is nothing to say. */
+  function motionText() {
+    const motion = Backend.motion;
+    if (!motion) return '';
+    if (motion.state === 'fault') return 'Board stopped: set the pieces to match the screen, then confirm';
+    if (motion.state === 'moving') return `Board moving ${motion.current}${motion.pending ? ` (+${motion.pending} queued)` : ''}`;
+    return motion.mode === 'simulated' ? 'Motors not connected' : 'Board ready';
   }
 
   function renderNewGamePanel() {
@@ -635,7 +648,7 @@
 
   function canPremove() {
     return state.status === 'playing' && state.mode !== 'friend' &&
-      (state.mode !== 'engine' || Backend.available && Backend.canControl) &&
+      (state.mode !== 'engine' || Backend.available && Backend.canControl && !boardFaulted()) &&
       state.game.turn !== state.playerColor && !state.pendingPromo && state.viewPly === null;
   }
 
@@ -680,7 +693,7 @@
 
   function canInteract() {
     return state.status === 'playing' && !state.pendingPromo && !state.thinking &&
-      (state.mode !== 'engine' || Backend.available && Backend.canControl && !Backend.pending) &&
+      (state.mode !== 'engine' || Backend.available && Backend.canControl && !Backend.pending && !boardFaulted()) &&
       (state.mode === 'friend' || state.game.turn === state.playerColor);
   }
 
@@ -1214,6 +1227,10 @@
     if (!Backend.authenticated) showAccess(); else reconnectPi({ force: true });
   });
   $('#remote-newgame').addEventListener('click', newGame);
+  el.motionResolve.addEventListener('click', async () => {
+    try { await Backend.request('api/motion-resolve', {}); await reconnectPi({ force: true }); }
+    catch (err) { toast(err.message, 4500); }
+  });
 
   // ----------------------------------------------------------------- boot
 
