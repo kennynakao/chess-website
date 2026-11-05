@@ -468,6 +468,8 @@ class WebsitePipelineTests(QueueTestCase):
         human, stockfish = self.driver.jobs
         self.assertEqual(human["label"], "e2e4")
         self.assertEqual(human["steps"], [{"op": "carry", "piece": "P", "from": "e2", "to": "e4", "path": [[4.0, 1.0], [4.0, 3.0]]}])
+        self.assertEqual((len(human["before"]), human["pieces"]["e2"]), (32, "P"), "the gantry program gets the board it starts from")
+        self.assertEqual(stockfish["pieces"]["e4"], "P")
         board = chess.Board()
         board.push_uci("e2e4")
         self.assertEqual(set(human["expect"]), occupied_squares(board))

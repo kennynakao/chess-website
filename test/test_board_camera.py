@@ -122,6 +122,20 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(set(undo[0]["expect"]), occupied_squares(board))
         self.assertEqual(set(plan_transition(["e2e4"], [], new_game=True)[0]["expect"]), occupied_squares(chess.Board()))
 
+    def test_jobs_say_what_is_on_the_board_before_them(self):
+        """The gantry program plans its own paths from "before" and "pieces", with each piece's real width."""
+        forward = plan_transition([], ["e2e4", "d7d5", "e4d5"])
+        self.assertEqual(len(forward[0]["before"]), 32)
+        self.assertEqual(forward[0]["pieces"]["e2"], "P")
+        self.assertNotIn("after_pieces", forward[0])
+        self.assertIn("e4", forward[1]["before"])
+        self.assertNotIn("e2", forward[1]["before"])
+        self.assertEqual(forward[2]["pieces"]["d5"], "p", "the pawn about to be taken")
+        undo = plan_transition(["e2e4", "d7d5", "e4d5"], ["e2e4"])
+        self.assertEqual((undo[0]["pieces"]["d5"], undo[0]["pieces"]["b:0"]), ("P", "p"), "undoing the capture starts from the board after it")
+        reset = plan_transition(["e2e4"], [], new_game=True)
+        self.assertIn("e4", reset[0]["before"])
+
 
 class InstructionTests(unittest.TestCase):
     def describe(self, *history):

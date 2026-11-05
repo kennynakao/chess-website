@@ -61,7 +61,10 @@ class BoardPipeline:
         self.abandoned_job = None  # Deleted by a new game while the worker was waiting on it.
         self.mismatch = None
         self.stage = None  # "gantry", "camera" or "stockfish" while that stage runs.
-        self.db.execute("CREATE TABLE IF NOT EXISTS motion_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL, steps TEXT NOT NULL, expect TEXT NOT NULL, status TEXT NOT NULL, error TEXT)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS motion_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL, steps TEXT NOT NULL, expect TEXT NOT NULL, status TEXT NOT NULL, error TEXT, context TEXT)")
+        if "context" not in {row[1] for row in self.db.execute("PRAGMA table_info(motion_jobs)")}:
+            # Databases from before the gantry program planned its own paths.
+            self.db.execute("ALTER TABLE motion_jobs ADD COLUMN context TEXT")
         # A job cut off by a restart may have left a piece anywhere: never assume it finished.
         with self.db:
             self.db.execute("UPDATE motion_jobs SET status='failed', error=? WHERE status='running'", (RESTARTED,))
@@ -105,8 +108,9 @@ class BoardPipeline:
 
     def queue(self, job: dict) -> None:
         """Inside the caller's transaction, so a game and the steps it owes the board commit together."""
-        self.db.execute("INSERT INTO motion_jobs (label, steps, expect, status) VALUES (?,?,?,'pending')",
-                        (job["label"], json.dumps(job["steps"]), json.dumps(job["expect"])))
+        context = {key: job[key] for key in ("before", "pieces") if key in job}
+        self.db.execute("INSERT INTO motion_jobs (label, steps, expect, status, context) VALUES (?,?,?,'pending',?)",
+                        (job["label"], json.dumps(job["steps"]), json.dumps(job["expect"]), json.dumps(context) if context else None))
 
     def drop_queued(self) -> int | None:
         """Inside the caller's transaction: forget steps nobody has done yet. Returns a waiting job's id, to abandon after the commit."""
@@ -261,7 +265,7 @@ class BoardPipeline:
         # A failure halts everything behind it: later steps assume the earlier ones happened.
         if self.db.execute("SELECT 1 FROM motion_jobs WHERE status='failed'").fetchone():
             return None
-        row = self.db.execute("SELECT id, label, steps, expect FROM motion_jobs WHERE status='pending' ORDER BY id").fetchone()
+        row = self.db.execute("SELECT id, label, steps, expect, context FROM motion_jobs WHERE status='pending' ORDER BY id").fetchone()
         if not row:
             return None
         steps, expect = stored_list(row[2]), stored_list(row[3])
@@ -270,4 +274,11 @@ class BoardPipeline:
             with self.db:
                 self.db.execute("UPDATE motion_jobs SET status='failed', error='A saved board step could not be read.' WHERE id=?", (row[0],))
             return None
-        return {"id": row[0], "label": row[1], "steps": steps, "expect": expect}
+        job = {"id": row[0], "label": row[1], "steps": steps, "expect": expect}
+        try:
+            context = json.loads(row[4]) if row[4] else {}
+        except ValueError:
+            context = {}
+        if isinstance(context, dict):
+            job.update({key: value for key, value in context.items() if key in ("before", "pieces")})
+        return job

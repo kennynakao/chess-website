@@ -143,10 +143,17 @@ def _replay(history: list[str]) -> tuple[Layout, list[dict]]:
     layout, board, plies = Layout(), chess.Board(), []
     for uci in history:
         move = chess.Move.from_uci(uci)
+        before = dict(layout.pieces)
         steps = _plan_ply(layout, board, move)
         board.push(move)
-        plies.append({"label": uci, "steps": steps, "expect": _on_board(layout)})
+        # "before" and "pieces" let the gantry program find its own paths with the real piece widths.
+        plies.append({"label": uci, "steps": steps, "expect": _on_board(layout),
+                      "before": sorted(before), "pieces": before, "after_pieces": dict(layout.pieces)})
     return layout, plies
+
+
+def _job(ply: dict) -> dict:
+    return {key: value for key, value in ply.items() if key != "after_pieces"}
 
 
 def _reversed_steps(steps: list[dict]) -> list[dict]:
@@ -168,14 +175,16 @@ def plan_transition(before: list[str], after: list[str], new_game: bool = False)
     """Jobs that take the physical board from game history `before` to `after`, in order."""
     layout, plies = _replay(before)
     if new_game:
+        pieces = dict(layout.pieces)
         steps = _plan_reset(layout)
-        return [{"label": "reset", "steps": steps, "expect": _on_board(Layout())}] if steps else []
+        return [{"label": "reset", "steps": steps, "expect": _on_board(Layout()), "before": sorted(pieces), "pieces": pieces}] if steps else []
     if after[:len(before)] == before:
-        return _replay(after)[1][len(before):]
+        return [_job(ply) for ply in _replay(after)[1][len(before):]]
     if before[:len(after)] == after:
         start = _on_board(Layout())
         return [{"label": "undo " + plies[i]["label"], "steps": _reversed_steps(plies[i]["steps"]),
-                 "expect": plies[i - 1]["expect"] if i else start}
+                 "expect": plies[i - 1]["expect"] if i else start,
+                 "before": sorted(plies[i]["after_pieces"]), "pieces": plies[i]["after_pieces"]}
                 for i in range(len(before) - 1, len(after) - 1, -1)]
     raise ValueError("These game histories are not connected by moves or takebacks.")
 
