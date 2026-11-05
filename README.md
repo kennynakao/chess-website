@@ -122,6 +122,17 @@ The Pi has three separate game functions, and none of them changes another:
 The choice is made per game on the play screen and sent as `"board": true` or `false` with
 `/api/new`; the Pi reports it back as `board` in every state.
 
+Website games are allowed only while the board's touch screen has **Online** selected (the
+fourth option on its menu, from `pi_touch.py` on the `pi-only` side). The screen sends
+`POST /api/online {"active": true}` every second while it is; without that heartbeat for
+10 s, or after `{"active": false}`, `/api/new`, `/api/move` and `/api/undo` answer 409
+`board_offline` ("Tap Online on the board's screen first") and the play screen says so.
+Every state carries `online` (whether games are allowed) and `clients` (how many other
+sessions talked to the Pi in the last 20 s, which is how the screen knows a player is
+connected). Set `CHESS_ONLINE_ALWAYS=1` in `relay.env` to skip the gate on a bench with no
+screen. The screen also reads `CHESS_WEBSITE_URL` (the address it shows) and
+`CHESS_ACCESS_CODE` (the code it shows) from `relay.env`.
+
 ### The gantry slot
 
 The gantry code is not written yet. The plan is Pi-to-Arduino: the Pi sends each step over

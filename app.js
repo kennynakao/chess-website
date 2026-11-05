@@ -43,6 +43,7 @@
       this.engineError = data.engineError || null;
       this.levels = Array.isArray(data.levels) ? data.levels : [];
       this.canControl = data.canControl === true;
+      this.online = data.online !== false;   // the board's screen must have Online selected (older Pis never say)
       this.motion = data.motion || null;
       this.revision = data.revision;
       this.gameId = data.gameId;
@@ -648,13 +649,14 @@
     el.playBotTitle.textContent = 'Play on the Pi';
     el.playBotSub.textContent = hardware && state.boardPref ? 'You play White · the pieces move on the board' : 'You play White · unlimited time';
     el.playBtn.textContent = Backend.pending ? 'Please wait…' : 'Play on the Pi';
-    el.playBtn.disabled = el.playBot.disabled = Backend.pending || (Backend.authenticated && (!Backend.available || !Backend.engine || !Backend.canControl));
+    el.playBtn.disabled = el.playBot.disabled = Backend.pending || (Backend.authenticated && (!Backend.available || !Backend.engine || !Backend.canControl || !Backend.online));
     el.playFriend.disabled = Backend.pending;
     el.backendStatus.textContent = !Backend.authenticated ? 'Use your board access code to connect.' :
       !Backend.available ? (Backend.error || 'The Pi is offline. Reconnect when it is online.') :
+      !Backend.online ? 'Tap Online on the board’s screen to connect this website to it.' :
       !Backend.canControl ? 'Another player is using this board. You can watch their game.' :
       !Backend.engine ? (Backend.engineError || 'Stockfish is not ready on the Pi.') : 'Your moves and the computer’s replies are processed on the Raspberry Pi.';
-    el.backendStatus.className = 'backend-status ' + (Backend.available && Backend.engine ? 'ok' : 'warn');
+    el.backendStatus.className = 'backend-status ' + (Backend.available && Backend.engine && Backend.online ? 'ok' : 'warn');
     el.soundToggle.classList.toggle('off', !state.sound);
     renderConnection();
   }

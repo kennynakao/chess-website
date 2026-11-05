@@ -43,7 +43,8 @@ from backend.chess_game import ChessGame, DIFFICULTIES, PromotionRequired, Stock
 MAX_BODY = 4096
 SESSION_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
 REQUEST_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
-ROUTES = {"/api/new", "/api/move", "/api/undo", "/api/motion-resolve", "/api/board-confirm", "/api/board-scan"}
+ROUTES = {"/api/new", "/api/move", "/api/undo", "/api/motion-resolve", "/api/board-confirm", "/api/board-scan", "/api/online"}
+BOARD_OFFLINE = "The board is not in Online mode. Tap Online on the board's screen first."
 ENGINE_UNAVAILABLE = "Stockfish is unavailable on the Pi."
 ENGINE_FAILED_DIGITAL = "Stockfish failed. Your move was not saved; try it again in a moment."
 ENGINE_FAILED_BOARD = "Stockfish failed. Your move is safe; retry when the Pi reconnects."
@@ -58,9 +59,15 @@ class ApiError(Exception):
 class GameService:
     """Serialize changes; commit game and deduplication record atomically."""
     def __init__(self, database: str | Path, engine_factory=StockfishPlayer,
-                 clock=time.time, lease_seconds=3600, motion_driver=None, camera=None):
+                 clock=time.time, lease_seconds=3600, motion_driver=None, camera=None, require_online=False):
         self.lock = threading.RLock()
         self.clock, self.lease_seconds = clock, lease_seconds
+        self.seen = {}  # session -> when it last asked for anything; the board's screen uses it to see who is connected
+        # Website games are allowed only while the board's touch screen has Online selected: it
+        # sends /api/online every second. require_online=False (tests, bench work) skips that.
+        self.require_online = require_online
+        self.online_until = 0.0
+        self.online_was = False
         self.engine_factory = engine_factory
         self.player = None
         self.engine_error = None
@@ -148,6 +155,35 @@ class GameService:
 
     # ------------------------------------------------------------------ snapshots
 
+    CLIENT_SECONDS = 20  # a browser polls every 5 s, so this is "still here"
+
+    def _note(self, session):
+        now = self.clock()
+        self.seen[session] = now
+        if len(self.seen) > 64:
+            for key in [k for k, t in self.seen.items() if now - t > self.CLIENT_SECONDS]:
+                del self.seen[key]
+
+    def _others(self, session):
+        """How many other sessions have talked to the Pi in the last CLIENT_SECONDS."""
+        now = self.clock()
+        return sum(1 for k, t in self.seen.items() if k != session and now - t <= self.CLIENT_SECONDS)
+
+    ONLINE_SECONDS = 10  # the screen's heartbeat comes every second; a dead screen ends Online mode
+
+    def online_active(self):
+        return not self.require_online or self.clock() < self.online_until
+
+    def set_online(self, session, active):
+        """The board's screen says whether Online is selected. Returns the state the screen shows."""
+        with self.lock:
+            self._note(session)
+            self.online_until = self.clock() + self.ONLINE_SECONDS if active else 0.0
+            if active != self.online_was:
+                logging.info("ONLINE mode %s (the board's screen)", "on" if active else "off")
+                self.online_was = active
+            return self._snapshot(session)
+
     def _owned(self, session, record=None, game=None):
         record, game = record or self.record, game or self.game
         return (record["owner"] is not None and record["owner"] != session
@@ -196,6 +232,8 @@ class GameService:
             "occupied": self._owned(session, record, game),
             "leaseExpiresAt": record["leaseExpiresAt"],
             "board": record["board"],
+            "clients": self._others(session),
+            "online": self.online_active(),
             "motion": self._motion_status(record, game),
         }
 
@@ -287,6 +325,7 @@ class GameService:
 
     def status(self, session):
         with self.lock:
+            self._note(session)
             self._connect_engine(throttled=True)
             return self._snapshot(session)
 
@@ -295,6 +334,10 @@ class GameService:
             raise ApiError(400, "Missing or invalid player session.", "invalid_session")
         if route not in ROUTES:
             raise ApiError(404, "Unknown API route.", "not_found")
+        with self.lock:
+            self._note(session)
+        if route == "/api/online":
+            return self.set_online(session, body.get("active") is True)
         if route == "/api/motion-resolve":
             return self.resolve_motion(session)
         if route == "/api/board-confirm":
@@ -321,6 +364,8 @@ class GameService:
                 raise ApiError(409, "The game changed. Reload its current state.", "stale_state", state=self._snapshot(session))
             if self._owned(session):
                 raise ApiError(409, "Another player is controlling the board.", "board_busy", state=self._snapshot(session))
+            if not self.online_active():
+                raise ApiError(409, BOARD_OFFLINE, "board_offline", state=self._snapshot(session))
             # A new game chooses: on the physical board, or on screen only. Later requests follow the game.
             board_game = body.get("board") is True if route == "/api/new" else self.record["board"]
             starting_over = route == "/api/new" and board_game and self.board.driver.needs_person
@@ -497,9 +542,12 @@ def main():
     path = Path(os.environ.get("CHESS_STATE_PATH", "~/.local/share/duen-chess/state.sqlite3")).expanduser().resolve()
     if path == REPO_ROOT or REPO_ROOT in path.parents:
         raise SystemExit("CHESS_STATE_PATH must be outside the source repository")
-    service = GameService(path, motion_driver=driver_from_env(), camera=camera_from_env())
+    always_online = os.environ.get("CHESS_ONLINE_ALWAYS", "").strip() == "1"
+    service = GameService(path, motion_driver=driver_from_env(), camera=camera_from_env(), require_online=not always_online)
     server = create_server(service, token, port=args.port)
-    logging.info("Pi API ready at http://127.0.0.1:%s; device=chessboard engine=%s gantry=%s camera=%s", args.port, service.player is not None, service.board.driver.name, service.board.camera is not None)
+    logging.info("Pi API ready at http://127.0.0.1:%s; device=chessboard engine=%s gantry=%s camera=%s online=%s", args.port,
+                 service.player is not None, service.board.driver.name, service.board.camera is not None,
+                 "always" if always_online else "when the screen selects Online")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

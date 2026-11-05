@@ -208,6 +208,16 @@ class RemoteGameTests(unittest.TestCase):
         self.assertEqual(len(attempts), 2)
         self.assertEqual(recovered["revision"], 0)
 
+    def test_status_counts_the_other_sessions_seen_recently(self):
+        self.assertEqual(self.service.status(ALICE)["clients"], 0, "nobody else yet")
+        self.service.status(BOB)
+        self.assertEqual(self.service.status(ALICE)["clients"], 1, "Bob is connected")
+        self.assertEqual(self.service.status(BOB)["clients"], 1, "and from Bob's side, Alice is")
+        self.now[0] += 21
+        self.assertEqual(self.service.status(ALICE)["clients"], 0, "Bob went quiet")
+        self.command("/api/new", BOB)
+        self.assertEqual(self.service.status(ALICE)["clients"], 1, "a move counts too")
+
     def test_claimable_repetition_has_authoritative_structured_outcome(self):
         self.service.game.start("beginner")
         for uci in ["g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1"]:
@@ -257,6 +267,59 @@ class RemoteGameTests(unittest.TestCase):
             self.assertEqual(status, 400)
         finally:
             server.shutdown(); server.server_close(); thread.join()
+
+
+class OnlineGateTests(unittest.TestCase):
+    """Website games run only while the board's screen has Online selected and keeps saying so."""
+
+    SCREEN = "touchscreen-" + "c" * 20
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.now = [1000]
+        self.engine = FakeEngine()
+        self.service = GameService(Path(self.temp.name) / "state.sqlite3", lambda: self.engine, lambda: self.now[0], require_online=True)
+
+    def tearDown(self):
+        self.service.close()
+        self.temp.cleanup()
+
+    def command(self, route, **fields):
+        state = self.service.status(ALICE)
+        self.now[0] += 1
+        return self.service.mutate(route, {"requestId": f"o-{self.now[0]}-{route.rsplit('/', 1)[1]}", "expectedGameId": state["gameId"],
+                                           "expectedRevision": state["revision"], **fields}, ALICE)
+
+    def heartbeat(self, active=True):
+        return self.service.mutate("/api/online", {"active": active}, self.SCREEN)
+
+    def test_nothing_starts_until_the_screen_selects_online(self):
+        self.assertFalse(self.service.status(ALICE)["online"])
+        with self.assertRaises(ApiError) as caught:
+            self.command("/api/new")
+        self.assertEqual(caught.exception.code, "board_offline")
+        self.assertIn("Tap Online", caught.exception.message)
+        shown = self.heartbeat()
+        self.assertTrue(shown["online"])
+        self.assertEqual(shown["clients"], 1, "the screen sees the browser that just asked")
+        self.command("/api/new")
+        self.assertEqual(len(self.command("/api/move", **{"from": "e2", "to": "e4"})["uciMoves"]), 2)
+
+    def test_online_ends_when_the_heartbeat_stops_or_says_so(self):
+        self.heartbeat()
+        self.now[0] += 11
+        self.assertFalse(self.service.status(ALICE)["online"], "no heartbeat for 11 s")
+        self.heartbeat()
+        self.assertTrue(self.service.status(ALICE)["online"])
+        self.heartbeat(active=False)
+        self.assertFalse(self.service.status(ALICE)["online"], "the screen left Online")
+        with self.assertRaises(ApiError) as caught:
+            self.command("/api/new")
+        self.assertEqual(caught.exception.code, "board_offline")
+
+    def test_status_still_answers_while_offline_so_the_website_can_say_why(self):
+        state = self.service.status(ALICE)
+        self.assertEqual((state["online"], state["ok"]), (False, True))
 
 
 class RecordingDriver:
