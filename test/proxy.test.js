@@ -192,6 +192,19 @@ test('board confirmation and scanning reach the Pi for a signed-in player only',
   }
 });
 
+test('a game ending reported by the website reaches the Pi for a signed-in player only', async () => {
+  const body = { requestId: 'end-1', expectedRevision: 4, expectedGameId: 'test-game', reason: 'timeout', loser: 'w' };
+  assert.equal((await request('end', { body })).status, 401);
+  assert.equal(calls.length, 0);
+  const cookie = await login();
+  mockReply(200, { ok: true, revision: 5, gameOver: true, outcome: { winner: 'b', result: '0-1', reason: 'timeout' }, result: 'Black wins on time.' });
+  const reply = await request('end', { body, headers: { cookie } });
+  assert.equal(reply.status, 200);
+  assert.equal(new URL(calls[0][0]).pathname, '/api/end');
+  assert.deepEqual(JSON.parse(calls[0][1].body), body);
+  assert.equal(reply.body.outcome.reason, 'timeout');
+});
+
 test('a relay token mismatch is reported as that, and never asks the player to sign in again', async () => {
   const cookie = await login();
   mockReply(401, { ok: false, error: 'Unauthorized.', code: 'unauthorized' });

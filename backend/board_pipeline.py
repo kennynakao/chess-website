@@ -14,8 +14,8 @@ The Pi has three separate ways to play, and this module is only the third:
 
 remote_server.py owns the chess game and its record. This module owns the motion_jobs queue
 in the same database and the worker thread that performs it. The gantry is whichever driver
-board_motion.driver_from_env() picked: nothing is connected today, and backend/gantry.py is
-the placeholder for the Pi-to-Arduino code. The camera is board_camera.camera_from_env().
+board_motion.driver_from_env() picked; backend/gantry.py runs the gantry branch's Pi driver
+once it is configured. The camera is board_camera.camera_from_env().
 Stockfish's stage is the only one that changes the game record, so the pipeline calls back
 into the service for it (reply_owed and play_reply). Every stage is logged as PIPELINE.
 """
@@ -112,10 +112,16 @@ class BoardPipeline:
         self.db.execute("INSERT INTO motion_jobs (label, steps, expect, status, context) VALUES (?,?,?,'pending',?)",
                         (job["label"], json.dumps(job["steps"]), json.dumps(job["expect"]), json.dumps(context) if context else None))
 
-    def drop_queued(self) -> int | None:
-        """Inside the caller's transaction: forget steps nobody has done yet. Returns a waiting job's id, to abandon after the commit."""
+    def drop_queued(self, failed: bool = False) -> int | None:
+        """Inside the caller's transaction: forget steps nobody has done yet. Returns a waiting job's id, to abandon after the commit.
+
+        With failed=True a stopped board is forgotten too: someone has checked the pieces (the
+        screen's camera saw the starting position, or a person pressed Reset Board), so the
+        failure no longer describes the board.
+        """
         waiting = self.db.execute("SELECT id FROM motion_jobs WHERE status='waiting'").fetchone()
-        self.db.execute("DELETE FROM motion_jobs WHERE status IN ('pending', 'waiting')")
+        statuses = ("pending", "waiting", "failed") if failed else ("pending", "waiting")
+        self.db.execute(f"DELETE FROM motion_jobs WHERE status IN ({','.join('?' * len(statuses))})", statuses)
         return waiting[0] if waiting else None
 
     def fault(self, label: str, error: str) -> None:

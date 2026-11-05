@@ -7,26 +7,31 @@ const elements = new Map();
 function node() { return { addEventListener() {}, setAttribute() {}, classList: { add() {}, remove() {}, toggle() {} }, style: {}, dataset: {}, value:'' }; }
 const document = { querySelector(s) { if (!elements.has(s)) elements.set(s,node()); return elements.get(s); }, querySelectorAll: () => [], addEventListener() {} };
 let handler, uuid=0;
+const stored = new Map();
 const context = { Chess, document, console, setTimeout: () => 1, clearTimeout() {}, setInterval() {}, performance: { now: () => 0 }, AbortController,
- crypto: { randomUUID: () => 'test-request-'+(++uuid) }, fetch: (...args) => handler(...args) };
+ crypto: { randomUUID: () => 'test-request-'+(++uuid) }, fetch: (...args) => handler(...args),
+ localStorage: { getItem: (k) => stored.has(k) ? stored.get(k) : null, setItem: (k, v) => { stored.set(k, String(v)); }, removeItem: (k) => { stored.delete(k); } } };
 vm.createContext(context);
 let source = fs.readFileSync(require.resolve('../app.js'),'utf8');
 const html = fs.readFileSync(require.resolve('../play.html'),'utf8');
 for (const match of source.matchAll(/\$\('#([a-z][a-z0-9-]*)'\)/g)) assert(html.includes('id="'+match[1]+'"'), 'missing element '+match[1]);
 source=source.slice(0,source.indexOf('  // ----------------------------------------------------------------- boot'))+`
- renderBoard = renderAll = renderPlayers = renderControls = renderNewGamePanel = renderConnection = hideModal = toast = () => {};
+ renderBoard = renderAll = renderPlayers = renderControls = renderNewGamePanel = renderConnection = renderClocks = hideModal = toast = () => {};
  Sound.play = (kind) => { app.lastSound = kind; };
- globalThis.app={Backend,state,applyRemoteState,startGame,requestEngineMove,reconnectPi,canInteract,canPremove,queuePremove,commitMove,takeback,motionText,scanBoard,confirmBoard,followBoardOnce};
+ globalThis.app={Backend,state,applyRemoteState,startGame,requestEngineMove,reconnectPi,canInteract,canPremove,queuePremove,commitMove,takeback,motionText,scanBoard,confirmBoard,followBoardOnce,resignOrAbort,resultText,tick,TIME_CONTROLS};
 })();`;
 vm.runInContext(source,context);
 const a=context.app,b=a.Backend,s=a.state;
+const clocks=()=>({w:s.clocks.w,b:s.clocks.b});   // a copy in this realm: deepEqual rejects the vm context's Object.prototype
 function snapshot(moves=[],rev=0,extra={}) { const g=new Chess();moves.forEach(m=>g.move(m));return {ok:true,device:'chessboard',engine:true,levels:[{id:'beginner',label:'Beginner'}],level:'beginner',canControl:true,revision:rev,gameId:'game-1',started:true,fen:g.fen(),uciMoves:moves,gameOver:false,...extra}; }
 function response(body,status=200) { return {ok:status<400,status,json:async()=>body}; }
 (async()=>{
  a.applyRemoteState(snapshot(['e2e4','e7e5'],2));
- assert.equal(s.game.history.length,2); assert.equal(s.snapshots.length,3);assert.equal(s.mode,'engine');assert.equal(s.tc.base,0);
+ assert.equal(s.game.history.length,2); assert.equal(s.snapshots.length,3);assert.equal(s.mode,'engine');
+ // The clocks are the browser's and come from the time control picked here (10 min until the player changes it).
+ assert.equal(s.tc.id,'10+0');assert.deepEqual(clocks(),{w:600000,b:600000});assert.equal(s.running,'w');
  assert.equal(b.revision,2);assert.equal(b.gameId,'game-1');assert(a.canInteract());
- console.log('PASS authoritative history hydration restores board, history, revision and unlimited remote play');
+ console.log('PASS authoritative history hydration restores board, history, revision and starts the clocks picked here');
  b.accept(snapshot([],0)); a.applyRemoteState(snapshot([],0)); assert.equal(b.revision,2);assert.equal(b.snapshot.uciMoves.length,2);assert.equal(s.game.history.length,2);
  console.log('PASS stale status response cannot roll metadata backward');
  let requests=[];handler=async(path,opts)=>{requests.push(JSON.parse(opts.body));if(requests.length===1)throw new TypeError('network');return response(snapshot(['e2e4','e7e5','g1f3','b8c6'],3));};
@@ -171,4 +176,64 @@ function response(body,status=200) { return {ok:status<400,status,json:async()=>
  s.boardPref=true;await a.startGame('engine');assert.equal(sent[0][0],'/api/new');assert.equal(sent[0][1].board,true);assert.equal(s.board,true);
  s.boardPref=false;await a.startGame('engine');assert.equal(sent[1][1].board,false);
  console.log('PASS a new game says whether it is played on the board');
+ // How a Pi game ends outside the rules: the website reports a resignation or a clock at zero, and the Pi's snapshot has the result.
+ const flush=()=>new Promise(resolve=>setImmediate(resolve));
+ a.applyRemoteState(snapshot(['e2e4','e7e5'],40,{serverId:'pi-b',board:true,motion:idle}));
+ const resigned=snapshot(['e2e4','e7e5'],41,{serverId:'pi-b',board:true,gameOver:true,outcome:{winner:'b',result:'0-1',reason:'resignation'},result:'Black wins by resignation.',ended:{reason:'resignation',winner:'b',result:'0-1'},motion:busy('gantry','reset')});
+ sent=[];handler=async(path,opts)=>{sent.push([path,JSON.parse(opts.body)]);return response(resigned);};
+ await a.resignOrAbort();
+ assert.equal(sent.length,1);assert.equal(sent[0][0],'/api/end');assert.equal(sent[0][1].reason,'resignation');assert.equal(sent[0][1].loser,'w');assert.equal(sent[0][1].expectedRevision,40);
+ assert.equal(s.status,'over');assert.equal(s.result.reason,'resignation');assert.equal(a.resultText(s.result),'Stockfish won by resignation');assert.equal(popup(),'You Lost');
+ assert.equal(a.motionText(),'The board is putting the pieces back…');assert.equal(a.canInteract(),false);
+ await a.resignOrAbort();assert.equal(sent.length,1,'a finished game is not resigned again');
+ console.log('PASS resigning tells the Pi, which answers with the result while the board puts the pieces back');
+ // The clocks in a Pi game: the time control picked here, the increment to whoever moved, and no time charged for the board's motion.
+ const game2=(moves,rev,extra={})=>snapshot(moves,rev,{serverId:'pi-b',gameId:'game-2',board:true,motion:idle,...extra});
+ s.tc=a.TIME_CONTROLS.find(t=>t.id==='3+2');
+ a.applyRemoteState(game2([],42));
+ assert.deepEqual(clocks(),{w:180000,b:180000});assert.equal(s.running,null,'the clocks wait for the first move');
+ context.performance.now=()=>4000;
+ handler=async()=>response(game2(['e2e4'],43,{motion:busy('gantry','e2e4')}));
+ a.commitMove('e2e4',{animate:false,source:'human'});await flush();await flush();
+ assert.equal(s.game.history.length,1);assert.equal(s.clocks.w,182000,'the mover gets the increment');assert.equal(s.running,'b');
+ context.performance.now=()=>9000;a.tick();assert.equal(s.clocks.b,180000,'the gantry carrying a piece costs nobody time');
+ b.accept(game2(['e2e4'],43,{motion:busy('stockfish')}));
+ context.performance.now=()=>12000;a.tick();assert.equal(s.clocks.b,177000,'Stockfish thinking is on its clock');
+ handler=async()=>response(game2(['e2e4','e7e5'],44,{motion:busy('gantry','e7e5')}));
+ await a.followBoardOnce();
+ assert.equal(s.clocks.b,179000,'its reply brings the increment');assert.equal(s.running,'w');
+ context.performance.now=()=>15000;a.tick();assert.equal(s.clocks.w,182000,'nor does carrying the reply');
+ b.accept(game2(['e2e4','e7e5'],44));
+ context.performance.now=()=>16000;a.tick();assert.equal(s.clocks.w,181000);
+ b.accept(game2(['e2e4','e7e5'],44,{canControl:false}));
+ context.performance.now=()=>20000;a.tick();assert.equal(s.clocks.w,181000,'a viewer\'s clocks stand still');
+ b.accept(game2(['e2e4','e7e5'],44));
+ assert.deepEqual(JSON.parse(context.localStorage.getItem('duen.chess.clocks')),{serverId:'pi-b',gameId:'game-2',tc:'3+2',clocks:{w:181000,b:179000}});
+ console.log('PASS a Pi game runs the clocks picked here, with the increment, and the board\'s motion costs nobody time');
+ // A Pass & Play game in between (or a reload) and the Pi game's clocks come back from storage, not from the start.
+ await a.startGame('friend');assert.equal(s.mode,'friend');assert.deepEqual(clocks(),{w:180000,b:180000});
+ s.tc=a.TIME_CONTROLS.find(t=>t.id==='10+0');
+ a.applyRemoteState(game2(['e2e4','e7e5'],44));
+ assert.equal(s.tc.id,'3+2');assert.deepEqual(clocks(),{w:181000,b:179000});assert.equal(s.running,'w');
+ console.log('PASS the clocks of a Pi game come back from storage after a reload or a Pass & Play game');
+ s.clocks.w=1;
+ context.performance.now=()=>25000;
+ sent=[];handler=async(path,opts)=>{sent.push([path,JSON.parse(opts.body)]);return response(game2(['e2e4','e7e5'],45,{gameOver:true,outcome:{winner:'b',result:'0-1',reason:'timeout'},result:'Black wins on time.'}));};
+ a.tick();a.tick();await flush();
+ assert.equal(sent.length,1);assert.equal(sent[0][0],'/api/end');assert.deepEqual([sent[0][1].reason,sent[0][1].loser],['timeout','w']);
+ assert.equal(s.status,'over');assert.equal(a.resultText(s.result),'Stockfish won on time');assert.equal(s.clocks.w,0);assert.equal(popup(),'You Lost');
+ context.performance.now=()=>0;
+ console.log('PASS a clock at zero is reported to the Pi once, and the result comes from its snapshot');
+ a.applyRemoteState(snapshot([],46,{serverId:'pi-b',gameId:'game-5',board:true,motion:idle}));
+ assert.deepEqual(clocks(),{w:180000,b:180000});assert.equal(s.running,null);
+ console.log('PASS the next game starts its clocks afresh');
+ a.applyRemoteState(snapshot(['e2e4','e7e5'],47,{serverId:'pi-b',gameId:'game-3',board:true,gameOver:true,outcome:{winner:null,result:null,reason:'abandoned'},result:'Game ended from the board.',ended:{reason:'abandoned',winner:null,result:null},motion:idle}));
+ assert.equal(s.status,'over');assert.equal(a.resultText(s.result),'Game abandoned');assert.equal(popup(),undefined);assert.equal(a.canInteract(),false);
+ console.log('PASS a game ended from the board shows as abandoned, without a popup for a player who comes back');
+ s.boardPrefStored=false;
+ b.accept(snapshot([],48,{serverId:'pi-b',started:false,online:true,motion:idle}));assert.equal(s.boardPref,true);
+ b.accept(snapshot([],49,{serverId:'pi-b',started:false,online:false,motion:idle}));assert.equal(s.boardPref,false);
+ s.boardPrefStored=true;s.boardPref=false;
+ b.accept(snapshot([],50,{serverId:'pi-b',started:false,online:true,motion:idle}));assert.equal(s.boardPref,false);
+ console.log('PASS Online on the board preselects playing on it until the player chooses otherwise');
 })().catch(err=>{console.error(err);process.exitCode=1;});

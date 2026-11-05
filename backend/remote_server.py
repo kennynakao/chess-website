@@ -10,6 +10,14 @@ Two kinds of website game share this service and its database, chosen per game o
 
 Playing in person on the touchscreen (pi_game.py / pi_touch.py on the pi-only branch) is a
 third, separate program that this service never touches.
+
+How a website game ends, besides the rules of chess: the website reports a clock at zero or
+a resignation on /api/end, or the board's screen presses End Game / Reset Board (/api/online
+{"reset": true}), which ends the running game as abandoned. Nothing ends a game on a timer.
+Every ending clears the lease and, for a board game, queues the reset that brings the pieces
+home, which the camera then checks. The screen reports a board it has verified at the
+starting position with /api/online {"fresh": true}, which replaces whatever game was on with
+an unstarted one so the next player finds the pairing screen, not somebody's old game.
 """
 from __future__ import annotations
 
@@ -43,8 +51,9 @@ from backend.chess_game import ChessGame, DIFFICULTIES, PromotionRequired, Stock
 MAX_BODY = 4096
 SESSION_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
 REQUEST_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
-ROUTES = {"/api/new", "/api/move", "/api/undo", "/api/motion-resolve", "/api/board-confirm", "/api/board-scan", "/api/online"}
+ROUTES = {"/api/new", "/api/move", "/api/undo", "/api/end", "/api/motion-resolve", "/api/board-confirm", "/api/board-scan", "/api/online"}
 BOARD_OFFLINE = "The board is not in Online mode. Tap Online on the board's screen first."
+GAME_OVER = "The game is over."
 ENGINE_UNAVAILABLE = "Stockfish is unavailable on the Pi."
 ENGINE_FAILED_DIGITAL = "Stockfish failed. Your move was not saved; try it again in a moment."
 ENGINE_FAILED_BOARD = "Stockfish failed. Your move is safe; retry when the Pi reconnects."
@@ -87,12 +96,15 @@ class GameService:
             # "board": a board game, played out on the physical board. "boardMoves": the game
             # history the physical board was last brought to; digital games leave it alone.
             "board": False, "boardMoves": [],
+            # "ended": how the game ended when the rules of chess did not end it (see _ended), else None.
+            "ended": None,
         }
         # Tells an open browser tab this is a different database, so old revision numbers no longer apply.
         self.record.setdefault("serverId", str(uuid.uuid4()))
         # Games saved before the digital game existed all ran through the board.
         self.record.setdefault("board", True)
         self.record.setdefault("boardMoves", list(self.record["uciMoves"]) if self.record["board"] else [])
+        self.record.setdefault("ended", None)
         self.game = self._restore(self.record)
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO state VALUES(1,?)", (json.dumps(self.record),))
@@ -174,26 +186,123 @@ class GameService:
     def online_active(self):
         return not self.require_online or self.clock() < self.online_until
 
-    def set_online(self, session, active):
-        """The board's screen says whether Online is selected. Returns the state the screen shows."""
+    def set_online(self, session, active, fresh=False, reset=False):
+        """The board's screen says whether Online is selected. Returns the state the screen shows.
+
+        With reset, someone pressed End Game / Reset Board on the screen: the game ends and the
+        pieces go home (see _reset_from_screen). With fresh, the screen's camera has just seen the
+        full starting position, so the old game is replaced by an unstarted one (see _fresh_board).
+        Reset wins when both are sent, since fresh would claim a board the reset has not yet put back.
+        """
         with self.lock:
             self._note(session)
             self.online_until = self.clock() + self.ONLINE_SECONDS if active else 0.0
             if active != self.online_was:
                 logging.info("ONLINE mode %s (the board's screen)", "on" if active else "off")
                 self.online_was = active
+            if reset:
+                self._reset_from_screen()
+            elif fresh:
+                self._fresh_board()
             return self._snapshot(session)
+
+    @staticmethod
+    def _over(record, game):
+        """A game is over when the rules say so, or when something outside them ended it."""
+        return game.board.is_game_over(claim_draw=True) or record["ended"] is not None
+
+    @staticmethod
+    def _ended(reason, loser=None, text=None):
+        """The record of a game ended outside the rules of chess: a clock, a resignation, or the board's screen.
+
+        "text" is what the website shows for it; an abandonment has no winner and no result.
+        """
+        winner = None if loser is None else ("b" if loser == "w" else "w")
+        if text is None:
+            if winner is None:
+                text = "Game abandoned."
+            else:
+                text = f"{'White' if winner == 'w' else 'Black'} wins {'on time' if reason == 'timeout' else 'by resignation'}."
+        return {"reason": reason, "winner": winner,
+                "result": None if winner is None else ("1-0" if winner == "w" else "0-1"), "text": text}
 
     def _owned(self, session, record=None, game=None):
         record, game = record or self.record, game or self.game
         return (record["owner"] is not None and record["owner"] != session
                 and record["leaseExpiresAt"] > self.clock()
-                and not game.board.is_game_over(claim_draw=True))
+                and not self._over(record, game))
 
     def _reply_owed(self, record=None, game=None):
         """In a board game, Stockfish's move is the pipeline's to make once the player's is on the board."""
         record, game = record or self.record, game or self.game
-        return record["board"] and game.started and game.board.turn == chess.BLACK and not game.board.is_game_over(claim_draw=True)
+        return record["board"] and game.started and game.board.turn == chess.BLACK and not self._over(record, game)
+
+    def _close_game(self, record):
+        """The game in `record` has just ended: nobody holds it any more, and a board game puts its pieces back.
+
+        Returns the jobs this owes the board, to queue in the caller's transaction. The camera
+        stage of the reset checks the whole starting position. `boardMoves` becomes [] now, so the
+        next /api/new finds an untouched board and plans nothing. The finished game itself stays
+        in the record for the website to show until the next game or a fresh board.
+        """
+        record["owner"], record["leaseExpiresAt"] = None, 0
+        if not record["board"]:
+            return []
+        jobs = plan_transition(record["boardMoves"], [], new_game=True)
+        record["boardMoves"] = []
+        return jobs
+
+    def _fresh_board(self):
+        """Under the lock. The screen's camera saw the starting position: start over from an untouched board.
+
+        Whatever game was on, finished or not, is replaced by an unstarted one with no owner,
+        so the website shows the pairing screen and anyone can start. Nothing is queued (the
+        pieces are already home) and anything queued or stopped is forgotten: the board has
+        been checked.
+        """
+        record = copy.deepcopy(self.record)
+        record.update(gameId=str(uuid.uuid4()), revision=record["revision"] + 1, started=False, uciMoves=[],
+                      owner=None, leaseExpiresAt=0, board=True, boardMoves=[], ended=None)
+        game = ChessGame()
+        game.level = record["level"]
+        with self.db:
+            self.db.execute("UPDATE state SET value=? WHERE id=1", (json.dumps(record),))
+            released = self.board.drop_queued(failed=True)
+        self.record, self.game = record, game
+        if released:
+            self.board.abandoned_job = released
+        self.board.ready.notify()
+        logging.info("FRESH board from the screen: game=%s revision=%s", record["gameId"], record["revision"])
+
+    def _reset_from_screen(self):
+        """Under the lock. End Game / Reset Board was pressed on the screen: the game ends and the pieces go home.
+
+        A running game ends as abandoned, in the screen's words; a finished one just loses its
+        lease. The reset is the only job left: steps nobody has done yet and a stopped board are
+        forgotten, because a person is at the board. When nothing has moved since the last
+        reset but a board game was played, a job with nothing to carry still runs so the camera
+        checks the starting position.
+        """
+        record = copy.deepcopy(self.record)
+        record["revision"] += 1
+        if self.game.started and not self._over(record, self.game):
+            record["ended"] = self._ended("abandoned", text="Game ended from the board.")
+        record["owner"], record["leaseExpiresAt"] = None, 0
+        jobs = []
+        if record["boardMoves"] or (self.game.started and record["board"]):
+            jobs = plan_transition(record["boardMoves"], [], new_game=True) or [starting_position_check()]
+            record["boardMoves"] = []
+        with self.db:
+            self.db.execute("UPDATE state SET value=? WHERE id=1", (json.dumps(record),))
+            released = self.board.drop_queued(failed=True)
+            for job in jobs:
+                self.board.queue(job)
+        self.record = record
+        if released:
+            self.board.abandoned_job = released
+        self.board.ready.notify()
+        logging.info("RESET from the screen: game=%s revision=%s %s", record["gameId"], record["revision"],
+                     "the board resets" if jobs else "nothing to put back")
 
     def _motion_status(self, record=None, game=None):
         return self.board.status(reply_owed=self._reply_owed(record, game))
@@ -218,6 +327,9 @@ class GameService:
                 "winner": None if outcome.winner is None else ("w" if outcome.winner else "b"),
                 "reason": reasons.get(outcome.termination, "draw"),
             }
+        ended = record["ended"]
+        if outcome is None and ended is not None:
+            structured_outcome = {"result": ended["result"], "winner": ended["winner"], "reason": ended["reason"]}
         return {
             "ok": True, "device": "chessboard", "engine": self.player is not None,
             "engineError": self.engine_error, "started": game.started, "level": game.level,
@@ -226,8 +338,9 @@ class GameService:
             "fen": board.fen(), "uciMoves": [m.uci() for m in board.move_stack],
             "sanMoves": list(game.san_moves), "revision": record["revision"],
             "gameId": record["gameId"], "serverId": record["serverId"], "turn": "w" if board.turn else "b",
-            "check": board.is_check(), "gameOver": outcome is not None, "outcome": structured_outcome,
-            "result": game.result_text(), "lastMove": game.last_move.uci() if game.last_move else None,
+            "check": board.is_check(), "gameOver": outcome is not None or ended is not None, "outcome": structured_outcome,
+            "result": game.result_text() if outcome else (ended["text"] if ended else None), "ended": ended,
+            "lastMove": game.last_move.uci() if game.last_move else None,
             "canControl": not self._owned(session, record, game),
             "occupied": self._owned(session, record, game),
             "leaseExpiresAt": record["leaseExpiresAt"],
@@ -271,12 +384,15 @@ class GameService:
             record.update(revision=record["revision"] + 1, uciMoves=[m.uci() for m in candidate.board.move_stack])
             jobs = plan_transition(self.record["boardMoves"], record["uciMoves"])
             record["boardMoves"] = list(record["uciMoves"])
+            if self._over(record, candidate):
+                # Stockfish ended the game: its move still finishes on the board, then the pieces go home.
+                jobs += self._close_game(record)
             with self.db:
                 self.db.execute("UPDATE state SET value=? WHERE id=1", (json.dumps(record),))
                 for job in jobs:
                     self.board.queue(job)
             self.record, self.game = record, candidate
-            logging.info("PIPELINE stockfish: played %s (%s)", move.uci(), san)
+            logging.info("PIPELINE stockfish: played %s (%s)%s", move.uci(), san, "; game over, the board resets" if len(jobs) > 1 else "")
         return True
 
     # ------------------------------------------------------------------ board-only requests
@@ -308,7 +424,7 @@ class GameService:
                 raise ApiError(409, "Reading the board is only for games played on the board.", "not_board_game")
             if self._motion_status()["state"] != "idle":
                 raise ApiError(409, "Finish the moves on the board first.", "board_moving", state=self._snapshot(session))
-            if not self.game.started or self.game.board.turn != chess.WHITE or self.game.board.is_game_over(claim_draw=True):
+            if not self.game.started or self.game.board.turn != chess.WHITE or self._over(self.record, self.game):
                 raise ApiError(409, "It is not your turn.", "not_your_turn")
             board, revision = self.game.board.copy(), self.record["revision"]
         try:
@@ -337,7 +453,7 @@ class GameService:
         with self.lock:
             self._note(session)
         if route == "/api/online":
-            return self.set_online(session, body.get("active") is True)
+            return self.set_online(session, body.get("active") is True, fresh=body.get("fresh") is True, reset=body.get("reset") is True)
         if route == "/api/motion-resolve":
             return self.resolve_motion(session)
         if route == "/api/board-confirm":
@@ -373,8 +489,10 @@ class GameService:
                 motion = self._motion_status()
                 if motion["state"] == "fault":
                     raise ApiError(409, "The physical board stopped. Check the pieces before moving again.", "board_fault", state=self._snapshot(session))
-                # One move at a time, all the way through the pipeline. A person can still abandon theirs.
-                if motion["state"] != "idle" and not starting_over:
+                # One move at a time, all the way through the pipeline. A person can still abandon theirs,
+                # and a clock or a resignation can end the game while the board is still moving: the
+                # move in progress finishes and the reset queues behind it.
+                if motion["state"] != "idle" and not starting_over and route != "/api/end":
                     raise ApiError(409, "Wait for the board to finish the current move.", "board_moving", state=self._snapshot(session))
             candidate = copy.deepcopy(self.game)
             record = copy.deepcopy(self.record)
@@ -387,7 +505,21 @@ class GameService:
                 candidate.start(level)
                 record["gameId"] = str(uuid.uuid4())
                 record["board"] = board_game
+                record["ended"] = None
+            elif route == "/api/end":
+                # The website saw a clock reach zero or the player resign. The rules of chess have not
+                # spoken, so the record says how it ended and the snapshot shows it until the next game.
+                reason, loser = body.get("reason"), body.get("loser")
+                if reason not in ("timeout", "resignation") or loser not in ("w", "b"):
+                    raise ApiError(400, "reason must be timeout or resignation, and loser w or b.", "invalid_end")
+                if not candidate.started:
+                    raise ApiError(400, "No game has started.", "not_started")
+                if self._over(record, candidate):
+                    raise ApiError(400, GAME_OVER, "game_over")
+                record["ended"] = self._ended(reason, loser)
             elif route == "/api/move":
+                if self._over(record, candidate):
+                    raise ApiError(400, GAME_OVER, "game_over")
                 source, target, promotion = body.get("from"), body.get("to"), body.get("promotion")
                 if not isinstance(source, str) or not isinstance(target, str) or (promotion is not None and not isinstance(promotion, str)):
                     raise ApiError(400, "Move squares and promotion must be strings.", "invalid_move")
@@ -410,6 +542,9 @@ class GameService:
             else:
                 if not candidate.started or not candidate.board.move_stack:
                     raise ApiError(400, "Nothing to take back.", "nothing_to_undo")
+                if self._over(record, candidate):
+                    # A finished board game has sent its pieces home; a takeback would replay the whole game onto the board.
+                    raise ApiError(400, GAME_OVER, "game_over")
                 count = min(2 if candidate.board.turn == chess.WHITE else 1, len(candidate.board.move_stack))
                 for _ in range(count):
                     candidate.board.pop()
@@ -431,6 +566,10 @@ class GameService:
                     # The camera read this move off the board, so the piece is already there.
                     jobs = jobs[1:]
                 record["boardMoves"] = list(record["uciMoves"])
+            if route != "/api/new" and self._over(record, candidate):
+                # Checkmate, a draw, a clock or a resignation: the lease ends with the game, and a board game
+                # puts its pieces back behind whatever this request still owes the board.
+                jobs += self._close_game(record)
             # The game and the signals it owes the board commit together, or not at all.
             with self.db:
                 self.db.execute("UPDATE state SET value=? WHERE id=1", (json.dumps(record),))
@@ -444,9 +583,10 @@ class GameService:
                 # Release the worker, which is still waiting on a step that no longer exists.
                 self.board.abandoned_job = released
             self.board.ready.notify()
-            logging.info("COMMIT route=%s request=%s game=%s revision=%s %s player=%s fen=%s",
+            logging.info("COMMIT route=%s request=%s game=%s revision=%s %s player=%s fen=%s%s",
                          route, request_id, record["gameId"], record["revision"], "board" if board_game else "digital",
-                         extra.get("human", {}).get("uci", "-"), candidate.board.fen())
+                         extra.get("human", {}).get("uci", "-"), candidate.board.fen(),
+                         f" ended={record['ended']['reason']}" if record["ended"] else "")
             return response
 
     def close(self):

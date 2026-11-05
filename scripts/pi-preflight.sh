@@ -173,8 +173,22 @@ echo "== Motion mode =="
 if envhas CHESS_MOTION_COMMAND && [ -n "$(envval CHESS_MOTION_COMMAND)" ]; then
   pass "mode: command (CHESS_MOTION_COMMAND is set; a motor program moves the pieces)"
 elif [ "$(envval CHESS_GANTRY | tr '[:upper:]' '[:lower:]')" = arduino ]; then
-  warn "mode: arduino (the Pi-to-Arduino gantry code in backend/gantry.py is not written yet: board games stop at their first move)" \
-    "leave CHESS_GANTRY unset in relay.env until that code exists; digital games are not affected"
+  # backend/gantry.py runs gantry_driver.py from the gantry branch once a port and the program are both there.
+  gport=$(envval CHESS_GANTRY_PORT); gdir=$(envval CHESS_GANTRY_DIR)
+  if [ -z "$gdir" ]; then
+    for candidate in "$HOME/chess-gantry/gantry/pi" "$HOME/Self-Moving-Chess-Board-Code/gantry/pi"; do
+      if [ -f "$candidate/gantry_driver.py" ]; then gdir=$candidate; break; fi
+    done
+  fi
+  if [ -z "$gport" ]; then
+    warn "mode: arduino, but CHESS_GANTRY_PORT is not set (board games stop at their first move)" "set CHESS_GANTRY_PORT=/dev/ttyUSB0 (the ESP32's port) in relay.env and restart duen-relay"
+  elif [ ! -f "$gdir/gantry_driver.py" ]; then
+    warn "mode: arduino, but gantry_driver.py was not found (board games stop at their first move)" "check out the gantry branch at ~/chess-gantry or set CHESS_GANTRY_DIR in relay.env"
+  elif [ ! -e "$gport" ]; then
+    warn "mode: arduino ($gdir/gantry_driver.py on $gport), but $gport is not present" "plug in the ESP32 and check: ls /dev/ttyUSB* /dev/ttyACM*"
+  else
+    pass "mode: arduino ($gdir/gantry_driver.py on $gport moves the pieces)"
+  fi
 else
   bm=$(envval CHESS_BOARD_MODE)
   if [ "$bm" = manual ]; then

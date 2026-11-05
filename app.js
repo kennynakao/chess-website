@@ -49,6 +49,8 @@
       this.gameId = data.gameId;
       this.snapshot = data;
       this.error = null;
+      // Online on the board's screen means the player came to play on the board: that is the default until they choose.
+      if (!state.boardPrefStored) state.boardPref = data.online === true && !!this.motion;
       return data;
     },
     async request(path, body, timeout = 12000) {
@@ -106,6 +108,8 @@
     newGame(level, board) { return this.call('api/new', { level, board: board === true }); },
     move(from, to, promotion) { return this.call('api/move', { from, to, promotion: promotion || null }); },
     undo() { return this.call('api/undo', {}); },
+    // The game ended outside the rules: a clock at zero or a resignation. The Pi records it and resets the board.
+    end(reason, loser) { return this.call('api/end', { reason, loser }); },
   };
 
   // ----------------------------------------------------------------- state
@@ -116,6 +120,7 @@
     mode: 'engine',        // engine (backend Stockfish) | computer (local casual bot) | friend
     board: false,          // this engine game is played out on the physical board (set by the Pi)
     boardPref: false,      // what the next engine game should be
+    boardPrefStored: false, // the player chose it; otherwise the board is preselected while its screen says Online
     playerColor: 'w',
     colorPref: 'random',
     level: 'beginner',
@@ -273,7 +278,8 @@
 
   function save() {
     try {
-      localStorage.setItem('duen.chess.prefs', JSON.stringify({ tc: state.tc.id, color: state.colorPref, sound: state.sound, level: state.level, pieceStyle: state.pieceStyle, board: state.boardPref }));
+      localStorage.setItem('duen.chess.prefs', JSON.stringify({ tc: state.tc.id, color: state.colorPref, sound: state.sound, level: state.level, pieceStyle: state.pieceStyle,
+        ...(state.boardPrefStored ? { board: state.boardPref } : {}) }));
     } catch (e) { /* ignore */ }
   }
   function restore() {
@@ -284,6 +290,7 @@
       if (p.level) state.level = p.level;
       if (p.pieceStyle === 'regular') state.pieceStyle = 'regular';
       if (typeof p.sound === 'boolean') state.sound = p.sound;
+      state.boardPrefStored = typeof p.board === 'boolean';
       state.boardPref = p.board === true;
     } catch (e) { /* ignore */ }
   }
@@ -472,7 +479,7 @@
     }
     if (state.status === 'over' && state.result) {
       const r = state.result;
-      const score = r.winner === 'w' ? '1-0' : r.winner === 'b' ? '0-1' : r.reason === 'aborted' ? '' : '½-½';
+      const score = r.winner === 'w' ? '1-0' : r.winner === 'b' ? '0-1' : noResult(r) ? '' : '½-½';
       html += `<div class="result-row">${score}<small>${resultText(r)}</small></div>`;
     }
     el.moves.innerHTML = html;
@@ -483,11 +490,16 @@
   function reasonText(reason) {
     return { checkmate: 'by checkmate', resignation: 'by resignation', timeout: 'on time', agreement: 'by agreement',
       stalemate: 'by stalemate', 'threefold repetition': 'by repetition', '50-move rule': 'by 50-move rule',
-      'insufficient material': 'by insufficient material', 'timeout vs insufficient material': 'by timeout vs insufficient material' }[reason] || reason;
+      'insufficient material': 'by insufficient material', 'timeout vs insufficient material': 'by timeout vs insufficient material',
+      abandoned: 'abandoned' }[reason] || reason;
   }
+
+  // Aborted here, or ended from the board's screen on the Pi: nobody won and it was not a draw either.
+  const noResult = (r) => r.reason === 'aborted' || r.reason === 'abandoned';
 
   function resultText(r) {
     if (r.reason === 'aborted') return 'Game aborted';
+    if (r.reason === 'abandoned') return 'Game abandoned';
     const names = playerNames();
     const who = r.winner ? names[r.winner].name : null;
     return who ? `${who} won ${reasonText(r.reason)}` : `Draw ${reasonText(r.reason)}`;
@@ -497,8 +509,9 @@
     const playing = state.status === 'playing';
     const plies = state.game.history.length;
     el.btnDraw.disabled = state.mode === 'engine' || !playing || state.thinking;
-    el.btnResign.disabled = state.mode === 'engine' || !playing || Backend.pending;
-    el.resignLabel.textContent = playing && plies < 2 ? 'Abort' : 'Resign';
+    // Resigning a Pi game is reported to the Pi, which records it and puts the pieces back.
+    el.btnResign.disabled = !playing || Backend.pending || (state.mode === 'engine' && (!Backend.available || !Backend.canControl));
+    el.resignLabel.textContent = playing && plies < 2 && state.mode !== 'engine' ? 'Abort' : 'Resign';
     el.btnTakeback.disabled = !playing || plies === 0 || state.thinking || Backend.pending ||
       (state.mode === 'engine' && (!Backend.available || !Backend.canControl || boardBusy()));
     el.btnRematch.disabled = el.btnNewGame.disabled = Backend.pending;
@@ -574,20 +587,24 @@
     }
     if (motion.state === 'moving') {
       const connected = motion.mode === 'simulated' ? ' (not connected)' : '';
+      // After a game ends the board docks and carries every piece home, and the camera checks the start.
+      if (motion.current === 'reset') return RESETTING;
       if (motion.stage === 'stockfish') return 'Stockfish thinking';
       if (motion.stage === 'camera') return `Camera checking ${motion.current}`;
       return `Gantry moving ${motion.current}${connected}`;
     }
     if (motion.mode === 'simulated') return motion.camera ? 'Gantry not connected' : 'Gantry and camera not connected';
-    if (motion.mode === 'arduino') return 'Gantry code not written yet';
+    if (motion.mode === 'arduino') return 'Gantry not set up on the Pi';
     return motion.mode === 'manual' ? 'Moving pieces by hand' : 'Board ready';
   }
+  const RESETTING = 'The board is putting the pieces back…';
+  const boardResetting = () => !!Backend.motion && Backend.motion.state === 'moving' && Backend.motion.current === 'reset';
 
   /** The state of the hardware, for the "On the board" choice before a game starts. */
   function boardOptionNote(motion) {
     if (!motion) return 'Pieces move on the physical board';
     if (motion.mode === 'simulated') return motion.camera ? 'Gantry not connected yet' : 'Gantry and camera not connected yet';
-    if (motion.mode === 'arduino') return 'Gantry code not written yet';
+    if (motion.mode === 'arduino') return 'Gantry not set up on the Pi yet';
     if (motion.mode === 'manual') return 'You move the pieces by hand';
     return motion.camera ? 'Gantry moves, camera checks' : 'Gantry moves the pieces';
   }
@@ -629,9 +646,24 @@
     } catch (err) { toast(err.message, 4500); }
   }
 
+  /** The time control menu, built once: the panel is re-rendered on every Pi poll and must not rebuild it under the pointer. */
+  function buildTcMenu() {
+    const groups = [];
+    for (const tc of TIME_CONTROLS) {
+      let g = groups.find((x) => x.name === tc.group);
+      if (!g) groups.push((g = { name: tc.group, items: [] }));
+      g.items.push(tc);
+    }
+    el.tcMenu.innerHTML = groups.map((g) =>
+      `<div class="tc-group"><div class="tc-group-name">${GROUP_ICON[g.name] || ''} ${g.name}</div><div class="tc-grid">` +
+      g.items.map((tc) => `<button type="button" class="tc-opt" data-tc="${tc.id}">${tc.label}</button>`).join('') +
+      '</div></div>').join('');
+  }
+
   function renderNewGamePanel() {
-    el.tcLabel.textContent = 'Unlimited';
-    el.tcButton.disabled = true;
+    // The clocks are this browser's, so the time control is the player's choice in every game, Pi games included.
+    el.tcLabel.textContent = state.tc.label;
+    $$('.tc-opt', el.tcMenu).forEach((button) => button.classList.toggle('on', button.dataset.tc === state.tc.id));
     el.colorRow.classList.add('hidden');
     el.levelRow.classList.remove('hidden');
     if (Backend.levels.length) {
@@ -647,14 +679,18 @@
       el.boardPickNote.textContent = boardOptionNote(hardware);
     }
     el.playBotTitle.textContent = 'Play on the Pi';
-    el.playBotSub.textContent = hardware && state.boardPref ? 'You play White · the pieces move on the board' : 'You play White · unlimited time';
+    const timing = state.tc.base ? state.tc.label : 'unlimited time';
+    el.playBotSub.textContent = hardware && state.boardPref ? `You play White · ${timing} · the pieces move on the board` : `You play White · ${timing}`;
     el.playBtn.textContent = Backend.pending ? 'Please wait…' : 'Play on the Pi';
-    el.playBtn.disabled = el.playBot.disabled = Backend.pending || (Backend.authenticated && (!Backend.available || !Backend.engine || !Backend.canControl || !Backend.online));
+    // A board game cannot start while the board is still putting the last game's pieces back.
+    const resetting = state.boardPref && boardResetting();
+    el.playBtn.disabled = el.playBot.disabled = Backend.pending || (Backend.authenticated && (!Backend.available || !Backend.engine || !Backend.canControl || !Backend.online || resetting));
     el.playFriend.disabled = Backend.pending;
     el.backendStatus.textContent = !Backend.authenticated ? 'Use your board access code to connect.' :
       !Backend.available ? (Backend.error || 'The Pi is offline. Reconnect when it is online.') :
       !Backend.online ? 'Tap Online on the board’s screen to connect this website to it.' :
       !Backend.canControl ? 'Another player is using this board. You can watch their game.' :
+      resetting ? RESETTING :
       !Backend.engine ? (Backend.engineError || 'Stockfish is not ready on the Pi.') : 'Your moves and the computer’s replies are processed on the Raspberry Pi.';
     el.backendStatus.className = 'backend-status ' + (Backend.available && Backend.engine && Backend.online ? 'ok' : 'warn');
     el.soundToggle.classList.toggle('off', !state.sound);
@@ -679,12 +715,12 @@
     }
     if (data.fen && !sameBoard(game.fen(), data.fen)) throw new Error('The Pi position could not be loaded. Reconnect to try again.');
     const premove = preservePremove ? state.premove : null;
+    const previousPlies = state.game.history.length;
     clearTimeout(state.botTimer);
     state.game = new Chess(); state.snapshots = []; pushSnapshot(null);
     for (const rec of records) pushSnapshot(state.game.move(rec.move));
     state.gameId++;
     state.mode = 'engine'; state.playerColor = 'w'; state.board = data.board === true;
-    state.tc = TIME_CONTROLS.find(t => t.id === 'inf'); state.running = null;
     state.level = data.level || state.level;
     state.selected = null; state.legal = []; state.pendingPromo = null; state.drag = null; state.hoverSq = null;
     state.premove = premove; state.viewPly = null; state.thinking = false;
@@ -692,6 +728,7 @@
       { winner: null, result: '1/2-1/2', reason: 'confirmed by the Pi' }) : null;
     state.status = !data.started ? 'idle' : data.gameOver ? 'over' : 'playing';
     if (state.status === 'over') state.premove = null;
+    syncClocks(data, previousPlies);
     el.promo.classList.add('hidden'); el.confirm.classList.add('hidden');
     el.board.classList.remove('dragging'); hideModal();
     el.panelNew.classList.toggle('hidden', state.status !== 'idle');
@@ -729,6 +766,7 @@
     pushSnapshot(null);
     state.clocks = { w: state.tc.base * 1000, b: state.tc.base * 1000 };
     state.running = null;
+    clockGame = null;   // a local game: the Pi game's clocks stay saved for when the tab comes back to it
     el.promo.classList.add('hidden');
     el.confirm.classList.add('hidden');
     hideModal();
@@ -745,7 +783,6 @@
     }
     resetGameState();
     state.mode = 'friend'; state.status = 'playing'; state.playerColor = 'w'; state.orientation = 'w';
-    state.tc = TIME_CONTROLS.find(t => t.id === 'inf');
     el.access.classList.add('hidden');
     el.panelNew.classList.add('hidden'); el.panelGame.classList.remove('hidden');
     renderAll(); Sound.play('start');
@@ -850,6 +887,7 @@
       state.clocks[mover] += state.tc.inc * 1000;
       state.running = g.turn;
       state.lastTick = performance.now();
+      saveClocks();
     }
 
     state.selected = null;
@@ -969,7 +1007,8 @@
     const r = state.result;
     const names = playerNames();
     let title, cls = '';
-    if (state.mode !== 'friend') {
+    if (r.reason === 'abandoned') { title = 'Game abandoned'; cls = 'draw'; }
+    else if (state.mode !== 'friend') {
       if (r.winner === state.playerColor) title = 'You Won!';
       else if (r.winner) { title = 'You Lost'; cls = 'lose'; }
       else { title = 'Draw'; cls = 'draw'; }
@@ -978,9 +1017,9 @@
       if (!r.winner) cls = 'draw';
     }
     el.modalTitle.textContent = title;
-    el.modalSub.textContent = reasonText(r.reason);
+    el.modalSub.textContent = r.reason === 'abandoned' ? 'ended from the board' : reasonText(r.reason);
     el.modalHeader.className = 'modal-header ' + cls;
-    el.modalScore.textContent = r.winner === 'w' ? '1 - 0' : r.winner === 'b' ? '0 - 1' : '½ - ½';
+    el.modalScore.textContent = r.winner === 'w' ? '1 - 0' : r.winner === 'b' ? '0 - 1' : noResult(r) ? '—' : '½ - ½';
     el.modalNameW.textContent = names.w.name;
     el.modalNameB.textContent = names.b.name;
     el.modalAvW.className = 'avatar ' + names.w.cls; el.modalAvW.textContent = names.w.initial;
@@ -990,10 +1029,28 @@
   function hideModal() { el.modal.classList.add('hidden'); }
 
   function resignOrAbort() {
-    if (state.status !== 'playing' || state.mode === 'engine') return;
+    if (state.status !== 'playing') return;
+    if (state.mode === 'engine') return reportEnd('resignation', state.playerColor);
     if (state.game.history.length < 2) { endGame(null, 'aborted'); toast('Game aborted'); return; }
     const loser = state.mode === 'friend' ? state.game.turn : state.playerColor;
     endGame(opp(loser), 'resignation');
+  }
+
+  let endReported = null;  // the Pi game whose end this tab has sent, so a clock at zero reports it once
+  /** Tell the Pi a game ended outside the rules (a clock at zero, a resignation). Its snapshot shows the result. */
+  async function reportEnd(reason, loser) {
+    if (state.mode !== 'engine' || state.status !== 'playing' || !Backend.canControl || endReported === Backend.gameId) return;
+    endReported = Backend.gameId;
+    state.running = null;
+    try {
+      applyRemoteState(await Backend.end(reason, loser));
+      if (state.status === 'over') announceResult();
+    } catch (err) {
+      await reconnectPi({ force: true });
+      // The Pi may have recorded the end even though its reply was lost.
+      if (state.status === 'over') announceResult();
+      else toast(err.message, 5000);
+    }
   }
 
   function offerDraw() {
@@ -1038,21 +1095,65 @@
 
   // ----------------------------------------------------------------- clock
 
+  // The clocks are this browser's: the Pi knows nothing about time. They belong to one game at a time and are kept in
+  // localStorage, so a reloaded tab (or one back from a Pass & Play game) carries a Pi game's clocks on where they were.
+  const CLOCKS_KEY = 'duen.chess.clocks';
+  let clockGame = null;   // { serverId, gameId } of the Pi game whose clocks state.clocks hold; null during a local game
+  let clocksSaved = 0;
+
+  function saveClocks() {
+    if (!clockGame || !state.tc.base) return;
+    clocksSaved = performance.now();
+    try { localStorage.setItem(CLOCKS_KEY, JSON.stringify({ ...clockGame, tc: state.tc.id, clocks: state.clocks })); } catch (e) { /* ignore */ }
+  }
+
+  /** Keep the clocks in step with a Pi snapshot: a new game gets new clocks; the same game gives each new mover the increment. */
+  function syncClocks(data, previousPlies) {
+    const plies = state.game.history.length;
+    if (!clockGame || clockGame.gameId !== data.gameId || clockGame.serverId !== data.serverId) {
+      clockGame = { serverId: data.serverId, gameId: data.gameId };
+      let saved = null;
+      try { saved = JSON.parse(localStorage.getItem(CLOCKS_KEY) || 'null'); } catch (e) { /* ignore */ }
+      if (data.started && saved && saved.gameId === data.gameId && saved.serverId === data.serverId && saved.clocks) {
+        state.tc = TIME_CONTROLS.find((t) => t.id === saved.tc) || state.tc;
+        state.clocks = { w: Math.max(0, +saved.clocks.w || 0), b: Math.max(0, +saved.clocks.b || 0) };
+      } else {
+        state.clocks = { w: state.tc.base * 1000, b: state.tc.base * 1000 };
+      }
+    } else if (state.tc.base) {
+      for (let ply = previousPlies; ply < plies; ply++) state.clocks[ply % 2 ? 'b' : 'w'] += state.tc.inc * 1000;
+    }
+    // As in a local game, the clocks start with White's first move.
+    state.running = state.status === 'playing' && plies ? state.game.turn : null;
+    state.lastTick = performance.now();
+    saveClocks();
+  }
+
   function tick() {
-    if (state.status !== 'playing' || !state.running || !state.tc.base) return;
+    if (state.status !== 'playing' || !state.tc.base) return;
     const now = performance.now();
-    state.clocks[state.running] -= now - state.lastTick;
+    // A viewer's copy of the clocks stands still. In a board game nobody is thinking while the pieces are carried,
+    // checked or waited for, so the clocks wait with the board; they run while Stockfish thinks.
+    const paused = state.mode === 'engine' && (!Backend.canControl || boardBusy() && !stockfishThinking());
+    if (state.running && !paused) state.clocks[state.running] -= now - state.lastTick;
     state.lastTick = now;
-    if (state.clocks[state.running] <= 0) {
-      state.clocks[state.running] = 0;
-      const loser = state.running;
-      const winner = opp(loser);
+    // Either clock may be the one at zero: Stockfish's can run out while its move is still with the Pi.
+    const loser = ['w', 'b'].find((color) => state.clocks[color] <= 0);
+    if (!loser) {
       renderClocks();
-      if (state.game.hasMatingMaterial(winner)) endGame(winner, 'timeout');
-      else endGame(null, 'timeout vs insufficient material');
+      if (clockGame && now - clocksSaved >= 1000) saveClocks();
       return;
     }
+    state.clocks[loser] = 0;
     renderClocks();
+    if (state.mode === 'engine') {
+      // The Pi records the result and, in a board game, puts the pieces back. Not while a move is still with it.
+      if (!Backend.pending && !state.thinking) reportEnd('timeout', loser);
+      return;
+    }
+    const winner = opp(loser);
+    if (state.game.hasMatingMaterial(winner)) endGame(winner, 'timeout');
+    else endGame(null, 'timeout vs insufficient material');
   }
   setInterval(tick, 100);
 
@@ -1193,6 +1294,7 @@
     state.tc = TIME_CONTROLS.find((t) => t.id === b.dataset.tc);
     save();
     renderNewGamePanel();
+    renderClocks();
     el.tcMenu.classList.add('hidden');
     el.tcButton.setAttribute('aria-expanded', 'false');
   });
@@ -1214,6 +1316,7 @@
     const b = e.target.closest('button');
     if (!b) return;
     state.boardPref = b.dataset.board === '1';
+    state.boardPrefStored = true;
     save();
     renderNewGamePanel();
   });
@@ -1223,8 +1326,8 @@
   el.playFriend.addEventListener('click', () => startGame('friend'));
 
   el.btnResign.addEventListener('click', () => {
-    if (state.status !== 'playing' || state.mode === 'engine') return;
-    if (state.game.history.length < 2) { resignOrAbort(); return; }
+    if (state.status !== 'playing') return;
+    if (state.game.history.length < 2 && state.mode !== 'engine') { resignOrAbort(); return; }
     el.confirmText.textContent = 'Are you sure you want to resign?';
     el.confirm.classList.remove('hidden');
     el.confirm.dataset.action = 'resign';
@@ -1292,7 +1395,7 @@
     copy(state.game.pgn({
       Event: 'DUEN chess', Site: location.host || 'local', Date: new Date().toISOString().slice(0, 10).replace(/-/g, '.'),
       White: names.w.name, Black: names.b.name,
-      Result: r ? (r.winner === 'w' ? '1-0' : r.winner === 'b' ? '0-1' : '1/2-1/2') : '*',
+      Result: r ? (r.winner === 'w' ? '1-0' : r.winner === 'b' ? '0-1' : noResult(r) ? '*' : '1/2-1/2') : '*',
       TimeControl: state.tc.base ? `${state.tc.base}+${state.tc.inc}` : '-',
     }), 'PGN');
   });
@@ -1354,6 +1457,7 @@
   restore();
   applyPieceStyle();
   buildSquares();
+  buildTcMenu();
   pushSnapshot(null);
   renderNewGamePanel();
   renderAll();

@@ -36,15 +36,19 @@ Vercel production environment variables:
 - `CHESS_SESSION_SECRET`: random key used to sign browser sessions.
 - `CHESS_ACCESS_CODE`: private board access code entered on the website.
 
-The Pi stores only `CHESS_RELAY_TOKEN`, `CHESS_STATE_PATH` and the optional
-`CHESS_MOTION_COMMAND` in `~/.config/duen-chess/relay.env` (mode 600). Never commit
-these values.
+The Pi stores only `CHESS_RELAY_TOKEN`, `CHESS_STATE_PATH` and the optional gantry settings
+(`CHESS_MOTION_COMMAND`, or `CHESS_GANTRY=arduino` with `CHESS_GANTRY_PORT`; see "The gantry
+slot") in `~/.config/duen-chess/relay.env` (mode 600). Never commit these values.
 The relay token is never returned to a browser. The player cookie is Secure,
 HttpOnly, and SameSite=Strict and expires after 24 hours.
 
 One browser session controls the board at a time. Other sessions can view it.
-The control lease lasts one hour, refreshed by successful commands. Remote play
-is untimed; clocks must be implemented on the Pi before timed remote play.
+The control lease lasts one hour, refreshed by successful commands, and ends with the game
+(see "How a website game ends"). The time control picked on the play screen applies to Pi games
+too. The clocks run in the browser, not on the Pi (Stockfish thinks for a fixed time per level
+and knows nothing about them): they start with White's first move, wait while the board carries,
+checks or waits for pieces, are kept in the browser's storage so a reloaded tab carries on where
+it was, and when one reaches zero the website reports it to the Pi.
 
 ## Pi setup
 
@@ -131,17 +135,59 @@ Every state carries `online` (whether games are allowed) and `clients` (how many
 sessions talked to the Pi in the last 20 s, which is how the screen knows a player is
 connected). Set `CHESS_ONLINE_ALWAYS=1` in `relay.env` to skip the gate on a bench with no
 screen. The screen also reads `CHESS_WEBSITE_URL` (the address it shows) and
-`CHESS_ACCESS_CODE` (the code it shows) from `relay.env`.
+`CHESS_ACCESS_CODE` (the code it shows) from `relay.env`. When the player presses Start game
+while the screen says Online, the play screen preselects **On the board** unless they have
+chosen otherwise before.
+
+### How a website game ends
+
+Besides checkmate and the draws, a website game ends in two ways, and never by an idle timer:
+an idle tab keeps its game.
+
+* The website reports a clock at zero or a resignation with `POST /api/end {"reason":
+  "timeout" | "resignation", "loser": "w" | "b", requestId, expectedGameId,
+  expectedRevision}`, which goes through the same deduplication, revision, lease and Online
+  checks as `/api/move` (400 `not_started` / `game_over` when there is nothing to end).
+* The board's screen presses **End Game / Reset Board**, which sends `POST /api/online
+  {"active": true, "reset": true}`: a running game ends with reason `abandoned`.
+
+Every state carries `ended` (null, or `{"reason", "winner", "result", "text"}`), and
+`gameOver` is true for either kind of ending: `outcome` becomes `{"result", "winner",
+"reason"}` with that reason, and `result` says it in words ("Black wins on time.", "White
+wins by resignation.", "Game ended from the board."). Whenever a board game ends, by the
+rules, by `/api/end` or from the screen, the Pi clears the lease and queues the reset in the
+same transaction: pieces off their home squares are docked, everything is carried home, and
+the pipeline's camera stage checks the full starting position (`motion.current` is `reset`
+while that runs; the play screen says "The board is putting the pieces back…"). A digital game
+only loses its lease. The finished game stays in the state, final position and all, until
+the next `/api/new`, which finds the board already set up and plans nothing. A reset from the
+screen also clears a stopped board and any steps nobody has done, so it is the only job left.
+
+Once the screen's own camera has verified the starting position it sends `POST /api/online
+{"active": true, "fresh": true}`: the record becomes a fresh, unstarted board game with a new
+`gameId`, no owner and no queued steps, so the next player sees the pairing screen instead of
+the previous player's game, and an open tab of that game gets `stale_state` on its next
+command. `reset` and `fresh` together do the reset.
 
 ### The gantry slot
 
-The gantry code is not written yet. The plan is Pi-to-Arduino: the Pi sends each step over
-USB serial and an Arduino drives the motors. `backend/gantry.py` is the placeholder for that
-code, with the job format and what the finished driver has to do. `CHESS_GANTRY=arduino`
-selects it, which today stops every board game at its first move with "not written yet",
-so leave it unset until the code exists. Until then board games log each job and carry on,
-or a motor program in any language can take the slot through `CHESS_MOTION_COMMAND` in
-`relay.env`:
+The gantry code lives on branch `gantry` of Self-Moving-Chess-Board-Code: ESP32 firmware and
+`gantry/pi/gantry_driver.py`, which performs one job from standard input and exits 0 when the
+pieces have stopped. `CHESS_GANTRY=arduino` in `relay.env` makes `backend/gantry.py` run it as
+
+```sh
+<python> <dir>/gantry_driver.py --port $CHESS_GANTRY_PORT --config <config> --quiet
+```
+
+with `CHESS_GANTRY_PORT` the ESP32's serial port (required, such as `/dev/ttyUSB0`),
+`<dir>` from `CHESS_GANTRY_DIR` or the first of `~/chess-gantry/gantry/pi` and
+`~/Self-Moving-Chess-Board-Code/gantry/pi` that has the program, `<config>` from
+`CHESS_GANTRY_CONFIG` or `<dir>/gantry_config.json`, and `<python>` from
+`CHESS_GANTRY_PYTHON`, else the pi-only checkout's `~/chess-board-pi-only/.venv/bin/python`
+when it exists, else the service's own interpreter. Until a port and the program are both
+there, the placeholder stops every board game at its first move and says what is missing.
+Board games with nothing configured log each job and carry on, and a motor program in any
+language can take the slot through `CHESS_MOTION_COMMAND` in `relay.env`:
 
 ```sh
 CHESS_MOTION_COMMAND="/home/smart/gantry/run_job --square-mm 57"

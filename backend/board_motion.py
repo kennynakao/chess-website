@@ -24,7 +24,8 @@ are separate and never come through here. Four ways to perform a job, chosen by
 driver_from_env():
 
     CHESS_MOTION_COMMAND=...    a gantry program: it gets each job as JSON on standard input
-    CHESS_GANTRY=arduino        the Pi-to-Arduino driver in gantry.py: NOT DONE YET, every job stops the game
+    CHESS_GANTRY=arduino        gantry.py runs gantry_driver.py from the gantry branch (CHESS_GANTRY_PORT, CHESS_GANTRY_DIR);
+                                until both are configured every job stops the game and says so
     CHESS_BOARD_MODE=manual     a person moves the pieces and confirms on the website
     none of these               no gantry yet: the job is logged and the game carries on
 """
