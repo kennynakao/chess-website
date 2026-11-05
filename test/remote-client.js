@@ -18,7 +18,7 @@ for (const match of source.matchAll(/\$\('#([a-z][a-z0-9-]*)'\)/g)) assert(html.
 source=source.slice(0,source.indexOf('  // ----------------------------------------------------------------- boot'))+`
  renderBoard = renderAll = renderPlayers = renderControls = renderNewGamePanel = renderConnection = renderClocks = hideModal = toast = () => {};
  Sound.play = (kind) => { app.lastSound = kind; };
- globalThis.app={Backend,state,applyRemoteState,startGame,requestEngineMove,reconnectPi,canInteract,canPremove,queuePremove,commitMove,takeback,motionText,scanBoard,confirmBoard,followBoardOnce,resignOrAbort,resultText,tick,TIME_CONTROLS};
+ globalThis.app={Backend,state,applyRemoteState,startGame,requestEngineMove,reconnectPi,canInteract,canPremove,queuePremove,commitMove,takeback,motionText,boardConfirmLabel,scanBoard,confirmBoard,followBoardOnce,resignOrAbort,resultText,tick,TIME_CONTROLS};
 })();`;
 vm.runInContext(source,context);
 const a=context.app,b=a.Backend,s=a.state;
@@ -236,4 +236,41 @@ function response(body,status=200) { return {ok:status<400,status,json:async()=>
  s.boardPrefStored=true;s.boardPref=false;
  b.accept(snapshot([],50,{serverId:'pi-b',started:false,online:true,motion:idle}));assert.equal(s.boardPref,false);
  console.log('PASS Online on the board preselects playing on it until the player chooses otherwise');
+ // A capture on the board: the gantry does not take the piece off. The board waits for the person there, and the clocks wait with it.
+ const game6=(moves,rev,extra={})=>snapshot(moves,rev,{serverId:'pi-b',gameId:'game-6',board:true,motion:idle,...extra});
+ const removing={mode:'command',state:'waiting',stage:'remove',current:'e4d5',jobId:9,pending:0,camera:true,error:null,instructions:['Take the black pawn off d5, then press Check.'],mismatch:null,problem:null};
+ s.tc=a.TIME_CONTROLS.find(t=>t.id==='3+2');
+ context.performance.now=()=>30000;
+ a.applyRemoteState(game6(['e2e4','d7d5'],60));
+ assert.deepEqual(clocks(),{w:180000,b:180000});assert.equal(s.running,'w');assert.equal(a.boardConfirmLabel(),'Done moving');
+ handler=async()=>response(game6(['e2e4','d7d5','e4d5'],61,{motion:removing}));
+ a.commitMove('e4d5',{animate:false,source:'human'});await flush();await flush();
+ assert.equal(s.game.history.length,3);assert.equal(s.running,'b');assert.equal(s.clocks.w,182000);
+ assert.equal(a.motionText(),'Waiting for the piece to be removed: Take the black pawn off d5, then press Check.');
+ assert.equal(a.boardConfirmLabel(),'Check');assert.equal(a.canInteract(),false);
+ context.performance.now=()=>36000;a.tick();assert.equal(s.clocks.b,180000,'nobody is charged while the board waits for a hand');
+ b.accept(game6(['e2e4','d7d5','e4d5'],61,{motion:{...removing,mismatch:{missing:[],extra:['d5'],uncertain:[]},problem:'d5 still has a piece on it.'}}));
+ assert.equal(a.motionText(),'Waiting for the piece to be removed: Take the black pawn off d5, then press Check. d5 still has a piece on it.');
+ assert.equal(a.boardConfirmLabel(),'Check','the button stays after a failed check');
+ sent=[];handler=async(path,opts)=>{sent.push([path,JSON.parse(opts.body)]);return response({ok:true});};
+ await a.confirmBoard();
+ assert.deepEqual(sent,[['/api/board-confirm',{jobId:9}]],'Check names the step and never overrides the camera');
+ b.accept(game6(['e2e4','d7d5','e4d5'],61,{motion:busy('gantry','e4d5')}));
+ assert.equal(a.boardConfirmLabel(),'Done moving');assert.equal(a.motionText(),'Gantry moving e4d5 (not connected)');
+ context.performance.now=()=>40000;a.tick();assert.equal(s.clocks.b,180000,'nor while the gantry carries the taker');
+ b.accept(game6(['e2e4','d7d5','e4d5'],61,{motion:busy('stockfish')}));
+ context.performance.now=()=>42000;a.tick();assert.equal(s.clocks.b,178000,'Stockfish thinking is on its clock');
+ // Stockfish recaptures: its move arrives and the board waits for the person again, now with White to move and White's clock standing still.
+ handler=async()=>response(game6(['e2e4','d7d5','e4d5','d8d5'],62,{motion:{...removing,current:'d8d5',jobId:10,instructions:['Take the white pawn off d5, then press Check.']}}));
+ await a.followBoardOnce();
+ assert.equal(s.game.history.length,4);assert.equal(s.running,'w');assert.equal(s.clocks.b,180000,'its move brings the increment');
+ assert.equal(a.motionText(),'Waiting for the piece to be removed: Take the white pawn off d5, then press Check.');
+ context.performance.now=()=>50000;a.tick();assert.equal(s.clocks.w,182000,'White is not charged while the board waits');
+ b.accept(game6(['e2e4','d7d5','e4d5','d8d5'],62,{motion:busy('gantry','d8d5')}));
+ context.performance.now=()=>52000;a.tick();assert.equal(s.clocks.w,182000);
+ b.accept(game6(['e2e4','d7d5','e4d5','d8d5'],62));
+ assert(a.canInteract());
+ context.performance.now=()=>53000;a.tick();assert.equal(s.clocks.w,181000,'White\'s clock runs again once the board is idle');
+ context.performance.now=()=>0;
+ console.log('PASS a capture waits for the piece to be taken off: the bar says so, Check asks the camera, and the clocks wait with the board');
 })().catch(err=>{console.error(err);process.exitCode=1;});

@@ -542,7 +542,10 @@
     const motion = Backend.motion || {};
     const waiting = motion.state === 'waiting';
     el.motionResolve.classList.toggle('hidden', !((boardFaulted() || waiting && motion.mismatch) && Backend.canControl));
+    el.motionResolve.textContent = removingPiece() ? 'Skip the check' : 'Pieces match the screen';
     el.boardConfirm.classList.toggle('hidden', !(waiting && Backend.canControl));
+    el.boardConfirm.textContent = boardConfirmLabel();
+    el.boardConfirm.title = removingPiece() ? 'Take a photo to check that the piece is off the board' : 'Use this after moving the pieces on the board';
     el.boardConfirm.disabled = false;
     el.boardScan.classList.toggle('hidden', !(motion.camera && motion.state === 'idle' && state.mode === 'engine' && state.board && canInteract()));
   }
@@ -553,6 +556,9 @@
   // only after all of them. A digital game never waits for the board.
   const boardBusy = () => state.board && !!Backend.motion && ['moving', 'waiting', 'fault'].includes(Backend.motion.state);
   const stockfishThinking = () => state.board && !!Backend.motion && Backend.motion.stage === 'stockfish';
+  // A capture: the gantry does not take pieces off. The board waits for the person there to lift it and press Check.
+  const removingPiece = () => !!Backend.motion && Backend.motion.state === 'waiting' && Backend.motion.stage === 'remove';
+  const boardConfirmLabel = () => removingPiece() ? 'Check' : 'Done moving';
 
   let followTimer = null, followingMyMove = false;
   function followBoard() {
@@ -583,11 +589,14 @@
     if (!state.board) return '';
     if (motion.state === 'waiting') {
       const queued = motion.pending ? ` (+${motion.pending} queued)` : '';
-      return [`On the board: ${(motion.instructions || []).join(' ')}${queued}`, boardProblemText(motion.mismatch)].filter(Boolean).join(' ');
+      const todo = `${(motion.instructions || []).join(' ')}${queued}`;
+      // The Pi puts what the camera saw into words for a Check; the older "Done moving" flow sends the raw mismatch.
+      const problem = motion.problem || boardProblemText(motion.mismatch);
+      return [motion.stage === 'remove' ? `Waiting for the piece to be removed: ${todo}` : `On the board: ${todo}`, problem].filter(Boolean).join(' ');
     }
     if (motion.state === 'moving') {
       const connected = motion.mode === 'simulated' ? ' (not connected)' : '';
-      // After a game ends the board docks and carries every piece home, and the camera checks the start.
+      // After a game ends the board carries every stray piece home, and the camera checks the start.
       if (motion.current === 'reset') return RESETTING;
       if (motion.stage === 'stockfish') return 'Stockfish thinking';
       if (motion.stage === 'camera') return `Camera checking ${motion.current}`;
@@ -620,7 +629,11 @@
     return `The camera sees ${parts.join(' and ')}.`;
   }
 
-  /** Tell the Pi the step on screen is done. Names that step, so a double press can't confirm the next one. */
+  /**
+   * Tell the Pi the step on screen is done ("Done moving"), or that a captured piece is off the board ("Check":
+   * the Pi then takes a photo and carries on only if the square is empty). Names the step, so a double press
+   * can't confirm the next one.
+   */
   async function confirmBoard(override = false) {
     el.boardConfirm.disabled = true;
     const jobId = Backend.motion && Backend.motion.jobId;
@@ -1133,7 +1146,8 @@
     if (state.status !== 'playing' || !state.tc.base) return;
     const now = performance.now();
     // A viewer's copy of the clocks stands still. In a board game nobody is thinking while the pieces are carried,
-    // checked or waited for, so the clocks wait with the board; they run while Stockfish thinks.
+    // checked or waited for (a captured piece being lifted off included), so the clocks wait with the board whenever
+    // it is moving, waiting or stopped; they run while Stockfish thinks, and the side to move's resumes once it is idle.
     const paused = state.mode === 'engine' && (!Backend.canControl || boardBusy() && !stockfishThinking());
     if (state.running && !paused) state.clocks[state.running] -= now - state.lastTick;
     state.lastTick = now;

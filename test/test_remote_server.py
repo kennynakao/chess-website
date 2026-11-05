@@ -353,10 +353,13 @@ class RecordingDriver:
 
 
 class FakeCamera:
-    """Sees the board the last job promised, or whatever a test says, and writes down that it looked."""
+    """Sees the board the last job promised, or whatever a test says, and writes down that it looked.
+
+    `frames` are observations for the next photos, in order; `seen` is for every photo after that.
+    """
 
     def __init__(self, driver, events):
-        self.driver, self.events, self.seen, self.fail, self.photos = driver, events, None, False, 0
+        self.driver, self.events, self.seen, self.fail, self.photos, self.frames = driver, events, None, False, 0, []
 
     def observe(self):
         self.photos += 1
@@ -364,9 +367,11 @@ class FakeCamera:
         self.events.append(("camera", job["label"] if job else None))
         if self.fail:
             raise OSError("camera unplugged")
+        if self.frames:
+            return self.frames.pop(0)
         if self.seen is not None:
             return self.seen
-        return BoardObservation(frozenset(job["expect"] if job else chess.Board().piece_map()))
+        return BoardObservation(frozenset(job["expect"] if job else occupied_squares(chess.Board())))
 
 
 class ScriptedEngine(FakeEngine):
@@ -424,6 +429,19 @@ class QueueTestCase(unittest.TestCase):
 
     def resolve(self, player=ALICE):
         return self.service.mutate("/api/motion-resolve", {}, player)
+
+    def confirm(self, player=ALICE, **body):
+        """Done moving, or Check after a captured piece has been lifted off."""
+        return self.service.mutate("/api/board-confirm", body, player)
+
+    def lift_off(self, label):
+        """The person at the board takes the captured piece of move `label` off and presses Check; the camera sees it gone."""
+        motion = self.wait_for(lambda m: m["stage"] == "remove" and m["current"] == label, f"waited for a hand on {label}")
+        # The board before this job is what the previous job left, minus the piece that was taken.
+        was = set(self.driver.jobs[-1]["expect"]) if self.driver.jobs else occupied_squares(chess.Board())
+        self.camera.frames.append(BoardObservation(frozenset(was - {label[2:4]})))
+        self.confirm(jobId=motion["jobId"])
+        return motion
 
     def wait_for(self, predicate, what):
         deadline = time.monotonic() + 5
@@ -491,10 +509,17 @@ class WebsitePipelineTests(QueueTestCase):
         self.assertEqual(set(stockfish["expect"]), occupied_squares(board))
         self.engine.replies = ["d8d5"]
         self.move("e4", "d5")
+        self.lift_off("e4d5")
+        self.lift_off("d8d5")
         self.settled()
         capture, recapture = self.driver.jobs[2:]
-        self.assertEqual([(s["piece"], s["from"], s["to"]) for s in capture["steps"]], [("p", "d5", "b:0"), ("P", "e4", "d5")])
-        self.assertEqual([(s["piece"], s["from"], s["to"]) for s in recapture["steps"]], [("P", "d5", "w:0"), ("q", "d8", "d5")])
+        # The program only ever gets the carries, with the board as it is once the taken piece is off.
+        self.assertEqual([(s["piece"], s["from"], s["to"]) for s in capture["steps"]], [("P", "e4", "d5")])
+        self.assertEqual((capture["label"], "d5" in capture["pieces"], "d5" in capture["before"], capture["pieces"]["e4"]), ("e4d5", False, False, "P"))
+        self.assertEqual([(s["piece"], s["from"], s["to"]) for s in recapture["steps"]], [("q", "d8", "d5")])
+        self.assertEqual(("d5" in recapture["pieces"], recapture["pieces"]["d8"]), (False, "q"))
+        board.push_uci("e4d5")
+        self.assertEqual(set(capture["expect"]), occupied_squares(board))
 
     def test_the_player_cannot_move_at_any_stage_until_the_turn_comes_back(self):
         self.command("/api/new")
@@ -572,12 +597,15 @@ class WebsitePipelineTests(QueueTestCase):
         reply = self.move("h5", "f7")
         self.assertTrue(reply["gameOver"])
         self.assertEqual(reply["outcome"]["reason"], "checkmate")
+        # Qxf7# takes a pawn: the board waits for it to come off, then the mating move finishes on the board,
+        # then the pieces go home and the camera checks the start.
+        self.assertEqual(self.lift_off("h5f7")["pending"], 1, "the reset is queued behind the capture")
         self.settled()
         self.assertEqual(self.engine.calls, asked)
-        # The mating move finishes on the board, then the pieces go home and the camera checks the start.
         self.assertEqual([job["label"] for job in self.driver.jobs[-2:]], ["h5f7", "reset"])
         self.assertEqual(self.events[-2:], [("gantry", "reset"), ("camera", "reset")])
         self.assertEqual(set(self.driver.jobs[-1]["expect"]), occupied_squares(chess.Board()))
+        self.assertIn({"op": "note", "message": "Put a black pawn on f7."}, self.driver.jobs[-1]["steps"])
         self.assertEqual(self.service.record["boardMoves"], [])
         self.assertTrue(self.service.status(BOB)["canControl"], "the lease ends with the game")
         state = self.service.status(ALICE)
@@ -628,6 +656,154 @@ class WebsitePipelineTests(QueueTestCase):
         motion = self.service.status(ALICE)["motion"]
         self.assertEqual(motion["state"], "fault")
         self.assertIn("restarted", motion["error"])
+
+
+class CaptureTests(QueueTestCase):
+    """The gantry never takes a captured piece off the board: the person there does, and the camera checks before the carry."""
+    camera_connected = True
+
+    def play_to_capture(self):
+        """e4 d5, then exd5 (Stockfish will answer Qxd5): the player's capture is the job that waits."""
+        self.engine.replies = ["d7d5", "d8d5"]
+        self.command("/api/new")
+        self.move("e2", "e4")
+        self.settled()
+        self.events.clear()
+        return self.move("e4", "d5")
+
+    def waiting_to_remove(self, label="e4d5"):
+        return self.wait_for(lambda m: m["stage"] == "remove" and m["current"] == label, f"waited for a hand on {label}")
+
+    def test_a_capture_waits_for_the_person_then_the_camera_then_the_gantry(self):
+        reply = self.play_to_capture()
+        self.assertEqual(reply["uciMoves"], ["e2e4", "d7d5", "e4d5"])
+        motion = self.waiting_to_remove()
+        self.assertEqual({key: motion[key] for key in ("state", "stage", "current", "instructions", "mismatch", "problem", "pending", "error")},
+                         {"state": "waiting", "stage": "remove", "current": "e4d5", "pending": 0, "error": None, "mismatch": None, "problem": None,
+                          "instructions": ["Take the black pawn off d5, then press Check."]})
+        self.assertIsInstance(motion["jobId"], int)
+        self.assertEqual(self.events, [], "nothing moves and Stockfish is not asked until the pawn is off")
+        with self.assertRaises(ApiError) as caught:
+            self.move("a2", "a3")
+        self.assertEqual(caught.exception.code, "board_moving")
+        # Check while the pawn is still there: a photo, the problem in words, and the job keeps waiting.
+        with self.assertLogs(level="WARNING"):
+            self.confirm(jobId=motion["jobId"])
+            motion = self.wait_for(lambda m: m["problem"], "reported the pawn")
+        self.assertEqual((motion["state"], motion["stage"], motion["problem"]), ("waiting", "remove", "d5 still has a piece on it."))
+        self.assertEqual(motion["mismatch"], {"missing": [], "extra": ["d5"], "uncertain": []})
+        self.assertEqual(self.events, [("camera", "d7d5")])
+        # The pawn comes off: the camera agrees, the gantry carries the taker, the camera checks it, Stockfish answers,
+        # and its recapture waits for the white pawn in turn.
+        self.lift_off("e4d5")
+        motion = self.waiting_to_remove("d8d5")
+        self.assertEqual(motion["instructions"], ["Take the white pawn off d5, then press Check."])
+        self.assertEqual(self.events[1:], [("camera", "d7d5"), ("gantry", "e4d5"), ("camera", "e4d5"), ("stockfish", "e4d5")])
+        self.lift_off("d8d5")
+        self.settled()
+        self.assertEqual(self.events[5:], [("camera", "e4d5"), ("gantry", "d8d5"), ("camera", "d8d5")])
+        self.assertEqual(self.moves(), ["e2e4", "d7d5", "e4d5", "d8d5"])
+        self.assertEqual([step["op"] for job in self.driver.jobs for step in job["steps"]], ["carry"] * 4, "the program never sees a remove step")
+
+    def test_a_check_with_the_wrong_square_cleared_says_what_the_camera_sees(self):
+        self.play_to_capture()
+        motion = self.waiting_to_remove()
+        was = set(self.driver.jobs[-1]["expect"])
+        self.camera.frames.append(BoardObservation(frozenset(was - {"e4"})))
+        with self.assertLogs(level="WARNING"):
+            self.confirm(jobId=motion["jobId"])
+            motion = self.wait_for(lambda m: m["problem"], "reported")
+        self.assertEqual(motion["problem"], "d5 still has a piece on it. The camera also sees no piece on e4.")
+        self.camera.frames.append(BoardObservation(frozenset(), ("d5",)))
+        with self.assertLogs(level="WARNING"):
+            self.confirm(jobId=motion["jobId"])
+            motion = self.wait_for(lambda m: m["problem"] and "tell" in m["problem"], "reported the doubt")
+        self.assertEqual(motion["problem"], "The camera can't tell about d5. Try again.")
+        self.camera.fail = True
+        with self.assertLogs(level="ERROR"):
+            self.confirm(jobId=motion["jobId"])
+            motion = self.wait_for(lambda m: m["problem"] and "photo" in m["problem"], "reported the camera")
+        self.camera.fail = False
+        self.assertEqual((motion["state"], motion["problem"]), ("waiting", "The camera could not take a photo."))
+
+    def test_override_carries_on_without_a_photo(self):
+        self.play_to_capture()
+        motion = self.waiting_to_remove()
+        self.confirm(override=True, jobId=motion["jobId"])
+        self.waiting_to_remove("d8d5")
+        self.assertEqual(self.events[:2], [("gantry", "e4d5"), ("camera", "e4d5")], "no photo before the carry")
+
+    def test_without_a_camera_a_check_is_taken_at_its_word(self):
+        self.service.board.camera = None
+        reply = self.play_to_capture()
+        self.assertFalse(reply["motion"]["camera"])
+        motion = self.waiting_to_remove()
+        self.confirm(jobId=motion["jobId"])
+        motion = self.waiting_to_remove("d8d5")
+        self.assertEqual(self.events, [("gantry", "e4d5"), ("stockfish", "e4d5")])
+        self.confirm(jobId=motion["jobId"])
+        self.settled()
+        self.assertEqual(self.events[2:], [("gantry", "d8d5")])
+
+    def test_a_press_for_another_step_or_before_the_wait_does_not_count(self):
+        self.play_to_capture()
+        motion = self.waiting_to_remove()
+        self.confirm(jobId=motion["jobId"] + 1)
+        time.sleep(0.05)
+        self.assertEqual((self.waiting_to_remove()["state"], self.events), ("waiting", []))
+
+    def test_the_board_screen_may_press_check_but_a_bystander_may_not(self):
+        self.play_to_capture()
+        motion = self.waiting_to_remove()
+        with self.assertRaises(ApiError) as caught:
+            self.confirm(BOB, jobId=motion["jobId"])
+        self.assertEqual(caught.exception.code, "board_busy")
+        self.service.mutate("/api/online", {"active": True}, SCREEN)
+        self.camera.frames.append(BoardObservation(frozenset(set(self.driver.jobs[-1]["expect"]) - {"d5"})))
+        shown = self.confirm(SCREEN, jobId=motion["jobId"])
+        self.assertTrue(shown["ok"])
+        self.waiting_to_remove("d8d5")
+        self.assertEqual(self.events[:3], [("camera", "d7d5"), ("gantry", "e4d5"), ("camera", "e4d5")])
+
+    def test_a_restart_while_waiting_asks_again_and_never_assumes_the_carry_happened(self):
+        self.play_to_capture()
+        self.waiting_to_remove()
+        self.service.close()
+        self.service = self.start()
+        motion = self.waiting_to_remove()
+        self.assertEqual((motion["state"], motion["instructions"]), ("waiting", ["Take the black pawn off d5, then press Check."]))
+        self.assertEqual(self.driver.jobs[-1]["label"], "d7d5", "the carry has not run")
+        self.lift_off("e4d5")
+        self.waiting_to_remove("d8d5")
+
+    def test_a_new_game_from_the_screen_releases_the_wait(self):
+        self.play_to_capture()
+        self.waiting_to_remove()
+        shown = self.service.mutate("/api/online", {"active": True, "reset": True}, SCREEN)
+        self.assertEqual((shown["gameOver"], shown["motion"]["current"]), (True, "reset"))
+        self.settled()
+        self.assertNotIn(("gantry", "e4d5"), self.events, "the abandoned capture is never carried")
+        self.assertEqual(self.events[-2:], [("gantry", "reset"), ("camera", "reset")])
+
+    def test_the_reset_after_captures_asks_for_the_taken_pieces_and_the_fault_names_the_squares(self):
+        self.play_to_capture()
+        self.lift_off("e4d5")
+        self.lift_off("d8d5")
+        self.settled()
+        self.events.clear()
+        # Nobody has put the taken pawns back when the camera looks.
+        self.camera.seen = BoardObservation(frozenset(occupied_squares(chess.Board()) - {"d7", "e2"}))
+        with self.assertLogs(level="WARNING"):
+            self.command("/api/end", reason="resignation", loser="w")
+            motion = self.settled("fault")
+        reset = self.driver.jobs[-1]
+        self.assertEqual([(s["piece"], s["from"], s["to"]) for s in reset["steps"] if s["op"] == "carry"], [("q", "d5", "d8")])
+        self.assertEqual([s["message"] for s in reset["steps"] if s["op"] == "note"], ["Put a black pawn on d7.", "Put a white pawn on e2."])
+        self.assertEqual(motion["error"], "The camera does not see the board the game expects: no piece on d7, e2.")
+        # The pawns go back, someone confirms, and the board is clear for the next game.
+        self.camera.seen = None
+        self.resolve()
+        self.assertEqual(self.settled()["state"], "idle")
 
 
 class NothingConnectedTests(QueueTestCase):
@@ -771,9 +947,6 @@ class PersonMovesPiecesTests(QueueTestCase):
         self.true_board = lambda: BoardObservation(frozenset(self.driver.jobs and () or occupied_squares(self.service.game.board)))
         self.camera.observe = lambda: self.seen_override or self.true_board()
         self.seen_override = None
-
-    def confirm(self, **body):
-        return self.service.mutate("/api/board-confirm", body, ALICE)
 
     def waiting_on(self, label):
         return self.wait_for(lambda m: m["state"] == "waiting" and m["current"] == label, f"waited on {label}")

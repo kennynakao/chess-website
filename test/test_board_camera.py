@@ -132,7 +132,9 @@ class ComparisonTests(unittest.TestCase):
         self.assertNotIn("e2", forward[1]["before"])
         self.assertEqual(forward[2]["pieces"]["d5"], "p", "the pawn about to be taken")
         undo = plan_transition(["e2e4", "d7d5", "e4d5"], ["e2e4"])
-        self.assertEqual((undo[0]["pieces"]["d5"], undo[0]["pieces"]["b:0"]), ("P", "p"), "undoing the capture starts from the board after it")
+        self.assertEqual((undo[0]["pieces"]["d5"], "e4" in undo[0]["pieces"]), ("P", False), "undoing the capture starts from the board after it")
+        self.assertEqual(sum(1 for symbol in undo[0]["pieces"].values() if symbol == "p"), 7, "the taken pawn is off the board, not docked beside it")
+        self.assertTrue(all(":" not in name for name in undo[0]["pieces"]))
         reset = plan_transition(["e2e4"], [], new_game=True)
         self.assertIn("e4", reset[0]["before"])
 
@@ -146,7 +148,7 @@ class InstructionTests(unittest.TestCase):
 
     def test_capture_says_to_remove_the_piece_first(self):
         self.assertEqual(self.describe("e2e4", "d7d5", "e4d5"),
-                         ["Remove the black pawn from d5.", "Move the white pawn from e4 to d5."])
+                         ["Take the black pawn off d5, then press Check.", "Move the white pawn from e4 to d5."])
 
     def test_castling_moves_both_pieces(self):
         self.assertEqual(self.describe("e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "f8c5", "e1g1"),
@@ -154,7 +156,7 @@ class InstructionTests(unittest.TestCase):
 
     def test_takeback_puts_a_captured_piece_back(self):
         back = plan_transition(["e2e4", "d7d5", "e4d5"], ["e2e4", "d7d5"])
-        self.assertEqual(describe_job(back[0]), ["Move the white pawn from d5 to e4.", "Put the black pawn on d5."])
+        self.assertEqual(describe_job(back[0]), ["Move the white pawn from d5 to e4.", "Put the black pawn back on d5."])
 
     def test_reset_is_one_instruction(self):
         self.assertEqual(describe_job(plan_transition(["e2e4"], [], new_game=True)[0]),

@@ -27,8 +27,10 @@ and board_pipeline.py hands the driver one job per chess move. board_motion.py d
 job: {"id": 7, "label": "e7e5", "expect": [...occupied squares...], "before": [...],
 "pieces": {...}, "steps": [...]}, where each step is {"op": "carry", "piece": "p",
 "from": "e7", "to": "e5", "path": [[4, 6], [4, 4]]} with points in squares (a1 is 0,0; x.5
-are the lanes between squares; captured pieces park at x = -1, -2 and 8, 9), or {"op":
-"note", "message": ...}. The in-person game on the touchscreen (pi_game.py and pi_touch.py on
+are the lanes between squares), or {"op": "note", "message": ...}. Captured pieces are lifted
+off by hand: the pipeline holds a job at its {"op": "remove", ...} step until the camera has
+seen the square empty, and runs the program only with the carries that follow, so the program
+never sees a remove step. The in-person game on the touchscreen (pi_game.py and pi_touch.py on
 the pi-only branch) has nothing to do with this file.
 """
 

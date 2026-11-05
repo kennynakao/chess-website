@@ -46,9 +46,10 @@ One browser session controls the board at a time. Other sessions can view it.
 The control lease lasts one hour, refreshed by successful commands, and ends with the game
 (see "How a website game ends"). The time control picked on the play screen applies to Pi games
 too. The clocks run in the browser, not on the Pi (Stockfish thinks for a fixed time per level
-and knows nothing about them): they start with White's first move, wait while the board carries,
-checks or waits for pieces, are kept in the browser's storage so a reloaded tab carries on where
-it was, and when one reaches zero the website reports it to the Pi.
+and knows nothing about them): they start with White's first move, stand still the whole time the
+board is moving, waiting (for a captured piece to be taken off, say) or stopped, and run again for
+the side to move once it is idle; they are kept in the browser's storage so a reloaded tab carries
+on where it was, and when one reaches zero the website reports it to the Pi.
 
 ## Pi setup
 
@@ -123,6 +124,20 @@ The Pi has three separate game functions, and none of them changes another:
   pieces were last left, so a board game started after digital games begins by putting them
   back.
 
+  **Captures.** The gantry never takes a captured piece off the board; a person at the board
+  does. When a move captures (en passant included), the gantry stage stops before the carry:
+  the state shows `motion.state` `waiting`, `motion.stage` `remove`, `motion.jobId` and
+  `motion.instructions` such as "Take the black pawn off d5, then press Check.", the play
+  screen's bar reads "Waiting for the piece to be removed: …" with a **Check** button, and
+  the clocks stand still. Check (`POST /api/board-confirm {"jobId"}`, from the player's
+  session or from the board's own screen, whose session heartbeats `/api/online`) makes the
+  camera look: the square must be empty and the rest of the board as it was before the move.
+  If it agrees, the gantry carries the capturing piece and the usual camera check follows; if
+  not, the state stays `waiting` and `motion.problem` says why ("d5 still has a piece on
+  it."), and Check can be pressed again. `{"override": true}` carries on without a photo, and
+  with no camera connected a Check is taken at its word. The gantry program only ever receives
+  the carries, with `before` and `pieces` describing the board once the piece is off.
+
 The choice is made per game on the play screen and sent as `"board": true` or `false` with
 `/api/new`; the Pi reports it back as `board` in every state.
 
@@ -156,9 +171,15 @@ Every state carries `ended` (null, or `{"reason", "winner", "result", "text"}`),
 "reason"}` with that reason, and `result` says it in words ("Black wins on time.", "White
 wins by resignation.", "Game ended from the board."). Whenever a board game ends, by the
 rules, by `/api/end` or from the screen, the Pi clears the lease and queues the reset in the
-same transaction: pieces off their home squares are docked, everything is carried home, and
-the pipeline's camera stage checks the full starting position (`motion.current` is `reset`
-while that runs; the play screen says "The board is putting the pieces back…"). A digital game
+same transaction: every piece off its home square is carried home (never onto an occupied
+square; two strays on each other's squares go via the middle of the board), the job notes which
+captured pieces to put back ("Put a black pawn on e7."), and the pipeline's camera stage checks
+the full starting position (`motion.current` is `reset` while that runs; the play screen says
+"The board is putting the pieces back…"). Pieces still missing stop the board with a message
+that names the squares ("The camera does not see the board the game expects: no piece on e7.")
+until they are put back and **Pieces match the screen** is pressed, or the screen's own camera
+verifies the start. A takeback of a capture works the same way: the taker is carried back and
+a note asks for the captured piece ("Put the black pawn back on d5."). A digital game
 only loses its lease. The finished game stays in the state, final position and all, until
 the next `/api/new`, which finds the board already set up and plans nothing. A reset from the
 screen also clears a stopped board and any steps nobody has done, so it is the only job left.
@@ -200,8 +221,12 @@ passant, promotion, takebacks, and the reset for a new game.
 
 Carried pieces pass others along the lanes between squares. The largest piece base in
 `assets/models/` is 27 mm wide, so two can only pass side by side if squares are at least
-54 mm. A promotion uses a captured piece of that type if there is one; otherwise the pawn
-stays on the board and stands in for it.
+54 mm. Captured pieces are not carried anywhere: the person at the board takes them off
+(see "Captures" above), so no step ever targets a square off the board, and a job's
+`{"op": "remove", ...}` step is handled by the pipeline, not the program. The docking lanes
+beside the board (twelve slots down each side in the board design) remain in the firmware for
+later; nothing plans a path to them. A promotion carries the pawn, which stands in for the new
+piece until someone swaps it by hand.
 
 ### The camera slot
 
