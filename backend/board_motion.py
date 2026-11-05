@@ -40,8 +40,12 @@ import subprocess
 
 import chess
 
+# Captured pieces dock in a lane beside the board: sketch 5 of the board design has twelve slots
+# down each side ("w:0".."w:11" on White's side, "b:0".."b:11" on Black's). A thirteenth piece of
+# one colour, which only happens after twelve captures, goes to a second lane (x = -2 / 9) that
+# the Pi may or may not have configured.
 SLOTS_PER_COLOR = 16
-SLOTS_PER_COLUMN = 8
+SLOTS_PER_COLUMN = 12
 # A full reset can carry every piece on the board, so the limit grows with the job.
 COMMAND_TIMEOUT_SECONDS = 60
 COMMAND_TIMEOUT_PER_STEP_SECONDS = 30
