@@ -6,9 +6,7 @@ Two kinds of website game share this service and its database, chosen per game o
   * the digital game ("board": false, the default): Stockfish answers inside the same
     request and nothing physical is touched;
   * the board game ("board": true): every move runs through backend/board_pipeline.py,
-    player's move, gantry, camera, Stockfish, gantry, camera, back to the player. A capture
-    waits in between for the person at the board to lift the taken piece off and press Check
-    (/api/board-confirm), which the camera verifies before the gantry carries the taker.
+    player's move, gantry, camera, Stockfish, gantry, camera, back to the player.
 
 Playing in person on the touchscreen (pi_game.py / pi_touch.py on the pi-only branch) is a
 third, separate program that this service never touches.
@@ -79,8 +77,6 @@ class GameService:
         self.require_online = require_online
         self.online_until = 0.0
         self.online_was = False
-        # The screen's own session: whoever stands at the board may confirm its steps, lease or no lease.
-        self.screen_session = None
         self.engine_factory = engine_factory
         self.player = None
         self.engine_error = None
@@ -200,8 +196,6 @@ class GameService:
         """
         with self.lock:
             self._note(session)
-            if active:
-                self.screen_session = session
             self.online_until = self.clock() + self.ONLINE_SECONDS if active else 0.0
             if active != self.online_was:
                 logging.info("ONLINE mode %s (the board's screen)", "on" if active else "off")
@@ -412,13 +406,9 @@ class GameService:
             return self._snapshot(session)
 
     def confirm_board(self, session, override=False, job_id=None):
-        """The person at the board says they are done, or presses Check after lifting a captured piece off.
-
-        The player's session and the board's own screen may both press it: the screen is the
-        person standing at the board. With override, the camera is not consulted.
-        """
+        """The person at the board says they are done. With override, the camera is not consulted."""
         with self.board.ready:
-            if session != self.screen_session and self._owned(session):
+            if self._owned(session):
                 raise ApiError(409, "Another player is controlling the board.", "board_busy", state=self._snapshot(session))
             self.board.confirm(job_id, override)
             return self._snapshot(session)

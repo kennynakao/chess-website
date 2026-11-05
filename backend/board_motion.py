@@ -11,19 +11,9 @@ is what a camera can check.
 Paths are in square units: a1 is (0, 0) and h8 is (7, 7). To perform a carry, go to
 the first point, engage the piece, follow the points in order, then release it.
 Whole numbers are square centers; x.5 and y.5 are the lanes between squares, where a
-carried piece can pass other pieces.
-
-The gantry never takes a captured piece off the board. A step with op "remove",
-
-    {"op": "remove", "piece": "p", "square": "d5"}
-
-asks the person at the board to lift that piece off. board_pipeline.py holds the job there,
-takes a photo each time they press Check, and sends the carry that follows only once the
-camera has seen the square empty. So a capture is [remove, carry], en passant removes the
-passed pawn's square, and taking a capture back can only carry the taker back: a note asks
-for the captured piece to be put back. A promotion carries the pawn, which stands in for the
-new piece until someone swaps it by hand. The reset before a new game carries every stray
-home and notes which captured pieces to put back; its "expect" is the full starting position.
+carried piece can pass other pieces. Captured pieces park off the board: White's at
+x = -1 and -2, Black's at x = 8 and 9, with y from 0 to 7. Those slots are named
+"w:0" to "w:15" and "b:0" to "b:15".
 
 A step with op "note" moves nothing; it is a message for whoever is watching.
 
@@ -51,34 +41,25 @@ import subprocess
 
 import chess
 
-# Jobs saved before captured pieces were lifted off by hand docked them beside the board, twelve
-# to a lane, in slots "w:0".."w:15" (x = -1, -2) and "b:0".."b:15" (x = 8, 9). The firmware keeps
-# those lanes; nothing planned here goes there any more.
+# Captured pieces dock in a lane beside the board: sketch 5 of the board design has twelve slots
+# down each side ("w:0".."w:11" on White's side, "b:0".."b:11" on Black's). A thirteenth piece of
+# one colour, which only happens after twelve captures, goes to a second lane (x = -2 / 9) that
+# the Pi may or may not have configured.
+SLOTS_PER_COLOR = 16
 SLOTS_PER_COLUMN = 12
 # A full reset can carry every piece on the board, so the limit grows with the job.
 COMMAND_TIMEOUT_SECONDS = 60
 COMMAND_TIMEOUT_PER_STEP_SECONDS = 30
-# The middle of the board, where a piece can wait while the reset untangles two strays on each other's home.
-ASIDE_SQUARES = [f"{file}{rank}" for rank in "3456" for file in chess.FILE_NAMES]
 
 
 def _xy(name: str) -> tuple[float, float]:
-    """Center of a board square ("e4"), or of a docking slot ("w:3") from an old job."""
+    """Center of a board square ("e4") or a parking slot ("w:3")."""
     if ":" in name:
         color, index = name[0], int(name[2:])
         column = index // SLOTS_PER_COLUMN
         x = -1 - column if color == "w" else 8 + column
         return float(x), float(index % SLOTS_PER_COLUMN)
     return float(ord(name[0]) - ord("a")), float(int(name[1]) - 1)
-
-
-def _piece_name(symbol: str) -> str:
-    """"black pawn" for "p"."""
-    return f"{'white' if symbol.isupper() else 'black'} {chess.piece_name(chess.PIECE_SYMBOLS.index(symbol.lower()))}"
-
-
-def _note(message: str) -> dict:
-    return {"op": "note", "message": message}
 
 
 def _corner(x: float, y: float, toward_x: float, toward_y: float) -> tuple[float, float]:
@@ -89,13 +70,15 @@ def _corner(x: float, y: float, toward_x: float, toward_y: float) -> tuple[float
 
 
 class Layout:
-    """Where every physical piece on the board is, keyed by square."""
+    """Where every physical piece is, keyed by square or parking slot."""
 
     def __init__(self) -> None:
         self.pieces = {chess.square_name(square): piece.symbol()
                        for square, piece in chess.Board().piece_map().items()}
 
     def _clear_line(self, source: str, target: str) -> bool:
+        if ":" in source or ":" in target:
+            return False
         (ax, ay), (bx, by) = _xy(source), _xy(target)
         dx, dy = bx - ax, by - ay
         if not (dx == 0 or dy == 0 or abs(dx) == abs(dy)):
@@ -119,36 +102,46 @@ class Layout:
         self.pieces[target] = piece
         return {"op": "carry", "piece": piece, "from": source, "to": target, "path": path}
 
-    def remove(self, square: str) -> dict:
-        """A person lifts the piece off the board; it is gone from the layout from here on."""
-        return {"op": "remove", "piece": self.pieces.pop(square), "square": square}
+    def park(self, square: str) -> dict:
+        color = "w" if self.pieces[square].isupper() else "b"
+        slot = next(f"{color}:{i}" for i in range(SLOTS_PER_COLOR) if f"{color}:{i}" not in self.pieces)
+        return self.carry(square, slot)
+
+    def parked(self, symbol: str) -> str | None:
+        return next((name for name, piece in sorted(self.pieces.items()) if piece == symbol and ":" in name), None)
 
 
 def _plan_ply(layout: Layout, board: chess.Board, move: chess.Move) -> list[dict]:
     source, target = chess.square_name(move.from_square), chess.square_name(move.to_square)
     steps = []
-    # The captured piece comes off first, by hand; the pipeline waits for that before the carry.
     if board.is_en_passant(move):
-        steps.append(layout.remove(target[0] + source[1]))
+        steps.append(layout.park(target[0] + source[1]))
     elif board.is_capture(move):
-        steps.append(layout.remove(target))
+        steps.append(layout.park(target))
 
     if board.is_castling(move):
         rank = source[1]
         rook_from, rook_to = ("h", "f") if board.is_kingside_castling(move) else ("a", "d")
         steps.append(layout.carry(source, target))
         steps.append(layout.carry(rook_from + rank, rook_to + rank))
+    elif move.promotion:
+        name = chess.piece_name(move.promotion)
+        wanted = chess.Piece(move.promotion, board.turn).symbol()
+        spare = layout.parked(wanted)
+        if spare:
+            steps.append(layout.park(source))
+            steps.append(layout.carry(spare, target))
+        else:
+            # No spare piece to swap in, so the pawn stays and stands in for it.
+            steps.append(layout.carry(source, target))
+            steps.append({"op": "note", "message": f"The pawn on {target} now counts as a {name}."})
     else:
         steps.append(layout.carry(source, target))
-        if move.promotion:
-            # The gantry has no spare pieces, so the pawn stays and stands in for the new piece.
-            name = chess.piece_name(move.promotion)
-            steps.append(_note(f"The pawn on {target} now counts as a {name}; swap it by hand if you have a spare piece."))
     return steps
 
 
 def _on_board(layout: Layout) -> list[str]:
-    return sorted(layout.pieces)
+    return sorted(name for name in layout.pieces if ":" not in name)
 
 
 def _replay(history: list[str]) -> tuple[Layout, list[dict]]:
@@ -169,37 +162,17 @@ def _job(ply: dict) -> dict:
 
 
 def _reversed_steps(steps: list[dict]) -> list[dict]:
-    """A takeback: the carries retraced; a piece that was lifted off can only be asked for."""
-    back = []
-    for step in reversed(steps):
-        if step["op"] == "carry":
-            back.append({**step, "from": step["to"], "to": step["from"], "path": step["path"][::-1]})
-        elif step["op"] == "remove":
-            back.append(_note(f"Put the {_piece_name(step['piece'])} back on {step['square']}."))
-    return back
+    return [{**step, "from": step["to"], "to": step["from"], "path": step["path"][::-1]}
+            for step in reversed(steps) if step["op"] == "carry"]
 
 
 def _plan_reset(layout: Layout) -> list[dict]:
-    """Carry every stray home, never onto an occupied square, then ask for the pieces that are gone."""
     home = Layout().pieces
-    homes = {}
+    steps = [layout.park(name) for name in sorted(layout.pieces)
+             if ":" not in name and home.get(name) != layout.pieces[name]]
     for square, symbol in sorted(home.items()):
-        homes.setdefault(symbol, []).append(square)
-    steps = []
-    while strays := sorted(name for name, piece in layout.pieces.items() if home.get(name) != piece):
-        for name in strays:
-            free = [square for square in homes[layout.pieces[name]] if square not in layout.pieces]
-            if free:
-                steps.append(layout.carry(name, free[0]))
-                break
-        else:
-            # Every stray's home squares hold other strays (a rook and a knight on each other's squares, say):
-            # one of the squares the first stray could go to is cleared into the middle of the board.
-            blocker = next((square for square in homes[layout.pieces[strays[0]]] if layout.pieces[square] != home[square]), None)
-            if blocker is None:
-                raise ValueError(f"More pieces of one kind than the starting position has: {layout.pieces}")
-            steps.append(layout.carry(blocker, next(square for square in ASIDE_SQUARES if square not in layout.pieces)))
-    steps += [_note(f"Put a {_piece_name(symbol)} on {square}.") for square, symbol in sorted(home.items()) if square not in layout.pieces]
+        if square not in layout.pieces:
+            steps.append(layout.carry(layout.parked(symbol), square))
     return steps
 
 
@@ -226,20 +199,24 @@ def starting_position_check() -> dict:
     return {"label": "reset", "steps": [], "expect": _on_board(Layout())}
 
 
-def describe_step(step: dict) -> str:
-    """What a person has to do for one step."""
-    if step["op"] == "note":
-        return step["message"]
-    if step["op"] == "remove":
-        return f"Take the {_piece_name(step['piece'])} off {step['square']}, then press Check."
-    return f"Move the {_piece_name(step['piece'])} from {step['from']} to {step['to']}."
-
-
 def describe_job(job: dict) -> list[str]:
     """What a person has to do to perform a job by hand."""
     if job["label"] == "reset":
         return ["Set up the standard starting position."]
-    return [describe_step(step) for step in job["steps"]]
+    lines = []
+    for step in job["steps"]:
+        if step["op"] != "carry":
+            lines.append(step["message"])
+            continue
+        symbol = step["piece"]
+        piece = f"{'white' if symbol.isupper() else 'black'} {chess.piece_name(chess.PIECE_SYMBOLS.index(symbol.lower()))}"
+        if ":" in step["to"]:
+            lines.append(f"Remove the {piece} from {step['from']}.")
+        elif ":" in step["from"]:
+            lines.append(f"Put the {piece} on {step['to']}.")
+        else:
+            lines.append(f"Move the {piece} from {step['from']} to {step['to']}.")
+    return lines
 
 
 class SimulatedDriver:
