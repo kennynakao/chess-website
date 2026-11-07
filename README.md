@@ -4,9 +4,11 @@ Website: https://chess-website-gules.vercel.app
 
 ## How a move travels
 
-Browser → Vercel API → authenticated HTTPS tunnel → Raspberry Pi → gantry → camera →
-Stockfish → gantry → camera → browser. The Pi validates each move and saves the game. The Mac
-is only a development/deployment tool; it is not in the live connection path.
+Browser → Vercel API → authenticated HTTPS tunnel → Raspberry Pi. In the digital game the Pi
+asks Stockfish for the reply; in a game on the board the gantry carries the move, the camera
+checks it, and the reply is the move the person at the board makes by hand. The Pi validates
+each move and saves the game. The Mac is only a development/deployment tool; it is not in the
+live connection path.
 
 The Pi must remain powered on and online. No router port forwarding is needed.
 No gantry or camera is connected yet, so nothing physically moves. Website games
@@ -105,18 +107,22 @@ The Pi has three separate game functions, and none of them changes another:
   them; it only reads their camera calibration.
 * **The digital game on the website** ("On screen", the default): Stockfish answers inside
   the same request and nothing physical moves.
-* **The board game on the website** ("On the board"): every move runs through the physical
-  board in this order, and each stage starts only when the one before it has finished:
+* **The board game on the website** ("On the board"): two people and no Stockfish. The person
+  at the physical board plays White and the website player plays Black. Each stage starts only
+  when the one before it has finished:
 
-  1. The player moves on the website, and the move is saved on the Pi.
-  2. The gantry moves that piece.
-  3. The camera checks the board.
-  4. Stockfish chooses its move, which is saved on the Pi.
-  5. The gantry moves that piece.
-  6. The camera checks the board.
-  7. The turn goes back to the player.
+  1. The person at the board moves a White piece by hand and taps Done on the board's screen,
+     which sends `POST /api/board-move`. The camera reads the move off the board and it is
+     saved on the Pi; nothing is sent to the gantry, because the piece is already there.
+  2. The website player moves Black, and the move is saved on the Pi.
+  3. The gantry moves that piece.
+  4. The camera checks the board.
+  5. The turn goes back to the person at the board.
 
-  `backend/board_pipeline.py` is that pipeline. If a stage fails, the game stops there and
+  Takebacks are off (`/api/undo` answers 409 `no_takebacks`), and every state says who plays
+  what: `playerColor` is the website player's colour (`"b"` on the board, `"w"` in the digital
+  game) and `boardColor` the colour of the person at the board (`"w"`, or null).
+  `backend/board_pipeline.py` is the pipeline. If a stage fails, the game stops there and
   the website says so. Set the pieces to match the screen and press **Pieces match the
   screen**; the game carries on from that point. Every stage is logged with the prefix
   `PIPELINE`, which `scripts/pi-logs.sh` shows live. The Pi remembers where the physical
@@ -124,12 +130,26 @@ The Pi has three separate game functions, and none of them changes another:
   back.
 
 The choice is made per game on the play screen and sent as `"board": true` or `false` with
-`/api/new`; the Pi reports it back as `board` in every state.
+`/api/new`; the Pi reports it back as `board` in every state. A board game starts without
+Stockfish; only the digital game needs it.
+
+`POST /api/board-move {"requestId"?, "promotion"?: "q"|"r"|"b"|"n", "move"?: uci}` is the
+board's screen's own route, called on the Pi with the relay token; the website's proxy does not
+relay it. It needs a running board game, White to move, an idle board, Online and a camera
+(409 `not_board_game`, `not_board_turn`, `board_moving`, `board_fault`, `game_over`,
+`board_offline`, `no_camera`; 503 `camera_failed`). It is deduplicated by `requestId` (made
+up when absent), and the website player keeps the lease. When the photo does not show exactly
+one legal move it answers 409 `board_move_unclear` with a message and the scan's `status`
+(`unchanged`, `no_match`, `uncertain` or `ambiguous`), `candidates`, `missing`, `extra` and
+`uncertain`. The camera sees only which squares are full: a promotion uses `promotion` (a
+queen by default), and a capture that could have been made on more than one square can be
+named with `move`, one of the `candidates`. On White's turn the website's `/api/move`
+answers 409 `not_your_turn`.
 
 Website games are allowed only while the board's touch screen has **Online** selected (the
 fourth option on its menu, from `pi_touch.py` on the `pi-only` side). The screen sends
 `POST /api/online {"active": true}` every second while it is; without that heartbeat for
-10 s, or after `{"active": false}`, `/api/new`, `/api/move` and `/api/undo` answer 409
+10 s, or after `{"active": false}`, `/api/new`, `/api/move`, `/api/undo` and `/api/board-move` answer 409
 `board_offline` ("Tap Online on the board's screen first") and the play screen says so.
 Every state carries `online` (whether games are allowed) and `clients` (how many other
 sessions talked to the Pi in the last 20 s, which is how the screen knows a player is
@@ -208,8 +228,10 @@ stays on the board and stands in for it.
 The service uses the vision code from a checkout of the `pi-only` branch at
 `~/chess-board-pi-only` or `~/Self-Moving-Chess-Board-Code`, under that checkout's own
 `.venv`. The camera switches on once the checkout has a calibration, and it checks the
-board only after a gantry has really moved something. `backend/board_camera.py` lists the
-settings. Restart `duen-relay` after calibrating.
+board only after a gantry has really moved something. It also reads the move the person at the
+board makes, so a game on the board cannot get past White's first move without it
+(`/api/board-move` answers `no_camera`). `backend/board_camera.py` lists the settings. Restart
+`duen-relay` after calibrating.
 
 `CHESS_BOARD_MODE=manual` puts a person in the gantry's place: the website says what to
 move, and **Done moving** takes the next step.

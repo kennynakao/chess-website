@@ -222,6 +222,14 @@ test('unsupported routes and methods cannot be relayed', async () => {
   assert.equal(calls.length, 0);
 });
 
+test('the board screen\'s own routes are never relayed, even for a signed-in player', async () => {
+  const cookie = await login();
+  for (const action of ['board-move', 'online']) {
+    assert.equal((await request(action, { body: {}, headers: { cookie } })).status, 404);
+  }
+  assert.equal(calls.length, 0);
+});
+
 test('upstream revision conflicts keep their authoritative state and status', async () => {
   const cookie = await login();
   const body = { ok: false, error: 'Stale revision', revision: 9, gameId: 'current', uciMoves: ['e2e4', 'e7e5'] };

@@ -105,8 +105,9 @@ class ChessGame:
             return set()
         return {chess.square_name(move.to_square) for move in self.board.legal_moves if move.from_square == square}
 
-    def play_human(self, source: str, target: str, promotion: str | None = None) -> str:
-        if not self.started or self.board.turn != chess.WHITE or self.board.is_game_over(claim_draw=True):
+    def play_human(self, source: str, target: str, promotion: str | None = None, color: chess.Color = chess.WHITE) -> str:
+        """A person's move. White unless `color` says otherwise: in a game on the board the website player is Black."""
+        if not self.started or self.board.turn != color or self.board.is_game_over(claim_draw=True):
             raise ValueError("It is not your turn.")
         try:
             from_square = chess.parse_square(source)
@@ -115,9 +116,10 @@ class ChessGame:
             raise ValueError("Choose squares on the board.") from exc
 
         piece = self.board.piece_at(from_square)
-        if piece is None or piece.color != chess.WHITE:
+        if piece is None or piece.color != color:
             raise ValueError("Choose one of your pieces.")
-        if piece.piece_type == chess.PAWN and chess.square_rank(to_square) == 7 and promotion is None:
+        last_rank = 7 if color == chess.WHITE else 0
+        if piece.piece_type == chess.PAWN and chess.square_rank(to_square) == last_rank and promotion is None:
             if any(move.from_square == from_square and move.to_square == to_square for move in self.board.legal_moves):
                 raise PromotionRequired("Choose a piece for your pawn.")
 

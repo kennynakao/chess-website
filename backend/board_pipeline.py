@@ -1,4 +1,4 @@
-"""The website board game: one move at a time through the gantry, the camera and Stockfish.
+"""The website board game: one move at a time through the gantry and the camera.
 
 The Pi has three separate ways to play, and this module is only the third:
 
@@ -6,18 +6,23 @@ The Pi has three separate ways to play, and this module is only the third:
     from the pi-only branch. That program has its own game and this service never touches it.
   * The digital game on the website: Stockfish answers inside the same request and no
     piece moves. remote_server.py handles that by itself.
-  * The board game on the website, started with "board": true: every move runs
+  * The board game on the website, started with "board": true. The person at the board
+    plays White and the website player Black, and the moves go round like this:
 
-        player's move -> gantry -> camera -> Stockfish -> gantry -> camera -> back to the player
+        website player's move -> gantry -> camera -> the person at the board's turn
+        their move, read by the camera when they tap Done on the board's screen -> the website player's turn
 
-    and each stage starts only when the one before it has finished. That is this module.
+    The website player's move is queued here, and each stage starts only when the one before
+    it has finished. That is this module. The move made at the board needs no gantry: the
+    service commits it (/api/board-move) and queues nothing for it.
 
 remote_server.py owns the chess game and its record. This module owns the motion_jobs queue
 in the same database and the worker thread that performs it. The gantry is whichever driver
 board_motion.driver_from_env() picked; backend/gantry.py runs the gantry branch's Pi driver
 once it is configured. The camera is board_camera.camera_from_env().
-Stockfish's stage is the only one that changes the game record, so the pipeline calls back
-into the service for it (reply_owed and play_reply). Every stage is logged as PIPELINE.
+The pipeline still has a reply stage, which calls back into the service (reply_owed and
+play_reply) because it would change the game record; no game owes it a reply any more, so the
+"stockfish" stage never comes. Every stage is logged as PIPELINE.
 """
 
 from __future__ import annotations

@@ -3,10 +3,15 @@
 
 Two kinds of website game share this service and its database, chosen per game on /api/new:
 
-  * the digital game ("board": false, the default): Stockfish answers inside the same
-    request and nothing physical is touched;
-  * the board game ("board": true): every move runs through backend/board_pipeline.py,
-    player's move, gantry, camera, Stockfish, gantry, camera, back to the player.
+  * the digital game ("board": false, the default): the website player is White and
+    Stockfish answers inside the same request; nothing physical is touched;
+  * the board game ("board": true): two people and no Stockfish. The person at the physical
+    board plays White and the website player plays Black. The website player's move runs
+    through backend/board_pipeline.py: saved, gantry, camera, then it is White's turn. The
+    person at the board moves a piece by hand and taps Done on the board's screen, which sends
+    /api/board-move: the camera reads the move off the board and it is saved with nothing for
+    the gantry to do (the piece is already there), and it is the website player's turn again.
+    Takebacks are off in a board game.
 
 Playing in person on the touchscreen (pi_game.py / pi_touch.py on the pi-only branch) is a
 third, separate program that this service never touches.
@@ -51,8 +56,17 @@ from backend.chess_game import ChessGame, DIFFICULTIES, PromotionRequired, Stock
 MAX_BODY = 4096
 SESSION_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
 REQUEST_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
-ROUTES = {"/api/new", "/api/move", "/api/undo", "/api/end", "/api/motion-resolve", "/api/board-confirm", "/api/board-scan", "/api/online"}
+UCI_PATTERN = re.compile(r"[a-h][1-8][a-h][1-8][qrbn]?\Z")
+# /api/board-move is the board's screen's own, on the Pi: the website's proxy does not relay it.
+ROUTES = {"/api/new", "/api/move", "/api/undo", "/api/end", "/api/motion-resolve", "/api/board-confirm", "/api/board-scan",
+          "/api/board-move", "/api/online"}
+PROMOTIONS = ("q", "r", "b", "n")
 BOARD_OFFLINE = "The board is not in Online mode. Tap Online on the board's screen first."
+BOARD_STOPPED = "The physical board stopped. Check the pieces before moving again."
+BOARD_STILL_MOVING = "Wait for the board to finish the current move."
+BOARD_PLAYS_WHITE = "The player at the board plays White. Wait for their move."
+ONLINE_PLAYER_TO_MOVE = "It is the online player's turn. Wait for their move."
+NO_TAKEBACKS = "Takebacks are off in a game on the board."
 GAME_OVER = "The game is over."
 ENGINE_UNAVAILABLE = "Stockfish is unavailable on the Pi."
 ENGINE_FAILED_DIGITAL = "Stockfish failed. Your move was not saved; try it again in a moment."
@@ -60,7 +74,7 @@ ENGINE_FAILED_BOARD = "Stockfish failed. Your move is safe; retry when the Pi re
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, message: str, code: str, **extra):
+    def __init__(self, status: int, message: str, code: str, /, **extra):
         super().__init__(message)
         self.status, self.message, self.code, self.extra = status, message, code, extra
 
@@ -109,7 +123,8 @@ class GameService:
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO state VALUES(1,?)", (json.dumps(self.record),))
         self._connect_engine()
-        # The board game's queue and worker. Stockfish's stage is this service's, so it calls back here.
+        # The board game's queue and worker. Its reply stage (reply_owed / play_reply) calls back here;
+        # no game owes it a reply any more, so that stage never comes (see _reply_owed).
         self.board = BoardPipeline(self.db, self.lock, motion_driver, camera,
                                    reply_owed=self._reply_owed, play_reply=self._play_reply)
         self.board.start()
@@ -233,9 +248,13 @@ class GameService:
                 and not self._over(record, game))
 
     def _reply_owed(self, record=None, game=None):
-        """In a board game, Stockfish's move is the pipeline's to make once the player's is on the board."""
-        record, game = record or self.record, game or self.game
-        return record["board"] and game.started and game.board.turn == chess.BLACK and not self._over(record, game)
+        """Whether the pipeline owes a reply after the move on the board. Never, now: Stockfish plays no board game.
+
+        In a board game White is the person at the board, whose move comes from the board's screen
+        (/api/board-move), and Black is the website player. The digital game's Stockfish answers
+        inside the request. The hook stays so the pipeline keeps its shape.
+        """
+        return False
 
     def _close_game(self, record):
         """The game in `record` has just ended: nobody holds it any more, and a board game puts its pieces back.
@@ -330,6 +349,10 @@ class GameService:
         ended = record["ended"]
         if outcome is None and ended is not None:
             structured_outcome = {"result": ended["result"], "winner": ended["winner"], "reason": ended["reason"]}
+        result = game.result_text() if outcome else (ended["text"] if ended else None)
+        if outcome and record["board"] and outcome.winner is not None:
+            # result_text() speaks to the digital game's player ("You win", "Stockfish wins"); a board game is two people.
+            result = f"{'White' if outcome.winner else 'Black'} wins by checkmate."
         return {
             "ok": True, "device": "chessboard", "engine": self.player is not None,
             "engineError": self.engine_error, "started": game.started, "level": game.level,
@@ -339,21 +362,27 @@ class GameService:
             "sanMoves": list(game.san_moves), "revision": record["revision"],
             "gameId": record["gameId"], "serverId": record["serverId"], "turn": "w" if board.turn else "b",
             "check": board.is_check(), "gameOver": outcome is not None or ended is not None, "outcome": structured_outcome,
-            "result": game.result_text() if outcome else (ended["text"] if ended else None), "ended": ended,
+            "result": result, "ended": ended,
             "lastMove": game.last_move.uci() if game.last_move else None,
             "canControl": not self._owned(session, record, game),
             "occupied": self._owned(session, record, game),
             "leaseExpiresAt": record["leaseExpiresAt"],
             "board": record["board"],
+            # The website player's colour, and the colour of the person at the physical board (None: nobody is).
+            "playerColor": "b" if record["board"] else "w",
+            "boardColor": "w" if record["board"] else None,
             "clients": self._others(session),
             "online": self.online_active(),
             "motion": self._motion_status(record, game),
         }
 
-    # ------------------------------------------------------------------ the board game's Stockfish stage
+    # ------------------------------------------------------------------ the pipeline's reply stage
 
     def _play_reply(self):
-        """Stockfish's turn in a board game, once the player's move is finished on the board. False when closing."""
+        """The pipeline's reply stage: Stockfish's move, saved and sent to the gantry. False when closing.
+
+        Unused while _reply_owed is False (no board game has Stockfish in it); kept as the pipeline's hook.
+        """
         with self.board.ready:
             self._connect_engine()
             player = self.player
@@ -437,6 +466,112 @@ class GameService:
                 raise ApiError(409, "The game changed. Reload its current state.", "stale_state", state=self._snapshot(session))
         return {"ok": True, "revision": revision, **scan_result(board, observation)}
 
+    # ------------------------------------------------------------------ the board's screen: White's move
+
+    def board_move(self, session, body):
+        """The board's screen: the person at the board has made White's move by hand and tapped Done.
+
+        The camera reads the move off the board, and it is committed like a website move, through
+        the same checks and deduplication (a requestId is made up when the screen sends none), with
+        two differences: nothing is planned for the gantry, because the piece is already there, and
+        the website player keeps the lease. A photo that does not show exactly one legal move
+        commits nothing and says why (409 board_move_unclear, with what the camera saw).
+
+        The camera sees which squares are full, not which piece is on them, so a piece that could
+        capture on more than one square looks the same whichever it took. The screen can then send
+        the one the person made as "move" (UCI, one of the candidates it was given).
+        """
+        request_id = body.get("requestId")
+        if request_id is None:
+            request_id = "board-" + uuid.uuid4().hex
+        elif not isinstance(request_id, str) or not REQUEST_PATTERN.fullmatch(request_id):
+            raise ApiError(400, "A valid requestId is required.", "invalid_request")
+        promotion, chosen = body.get("promotion"), body.get("move")
+        if promotion is not None and promotion not in PROMOTIONS:
+            raise ApiError(400, "promotion must be q, r, b or n.", "invalid_move")
+        if chosen is not None and not (isinstance(chosen, str) and UCI_PATTERN.fullmatch(chosen)):
+            raise ApiError(400, "move must be a move in UCI, such as e2e4.", "invalid_move")
+        fingerprint = self._fingerprint(session, "/api/board-move", body)
+        with self.lock:
+            cached = self._replay(request_id, fingerprint)
+            if cached is not None:
+                return cached
+            self._require_board_turn(session)
+            board, revision, game_id = self.game.board.copy(), self.record["revision"], self.record["gameId"]
+        try:
+            observation = self.board.observe()  # Not under the lock: a photo takes seconds.
+        except Exception as exc:
+            logging.exception("CAMERA failed reading the move at the board")
+            raise ApiError(503, "The camera could not take a photo.", "camera_failed") from exc
+        with self.lock:
+            # The same request, retried while this one was looking, may have committed already.
+            cached = self._replay(request_id, fingerprint)
+            if cached is not None:
+                return cached
+            if self.record["revision"] != revision:
+                raise ApiError(409, "The game changed while the camera was looking. Tap Done again.", "stale_state",
+                               state=self._snapshot(session))
+            move = self._read_move(scan_result(board, observation), promotion, chosen)
+            logging.info("BOARD the camera read %s (%s) at the board", move["uci"], move["san"])
+            command = {"expectedGameId": game_id, "expectedRevision": revision,
+                       "from": move["from"], "to": move["to"], "promotion": move["promotion"]}
+            return self._commit("/api/board-move", command, session, request_id, fingerprint)
+
+    def _require_board_turn(self, session):
+        """Under the lock. /api/board-move needs White to move in a running board game, an idle board and a camera."""
+        def refuse(message, code):
+            raise ApiError(409, message, code, state=self._snapshot(session))
+        if not self.online_active():
+            refuse(BOARD_OFFLINE, "board_offline")
+        if not self.record["board"]:
+            refuse("The game on the website is played on screen, not on the board.", "not_board_game")
+        if not self.game.started:
+            refuse("No game on the board has started.", "not_board_game")
+        if self._over(self.record, self.game):
+            refuse(GAME_OVER, "game_over")
+        motion = self._motion_status()["state"]
+        if motion == "fault":
+            refuse(BOARD_STOPPED, "board_fault")
+        if motion != "idle":
+            refuse(BOARD_STILL_MOVING, "board_moving")
+        if self.game.board.turn != chess.WHITE:
+            refuse(ONLINE_PLAYER_TO_MOVE, "not_board_turn")
+        if self.board.camera is None:
+            refuse("No camera is connected to the board.", "no_camera")
+
+    @staticmethod
+    def _read_move(scan, promotion, chosen=None):
+        """The one legal move a photo of the board shows, else 409 board_move_unclear with the scan.
+
+        The camera sees which squares are full, not which piece is on them, so a pawn reaching the
+        last rank matches all four promotions: then the screen's promotion decides, or a queen.
+        A move the screen chose (`chosen`) must be one of those the photo fits.
+        """
+        candidates, status = scan["candidates"], scan["status"]
+        fits = candidates if chosen is None else [c for c in candidates if c["uci"] in (chosen, chosen + (promotion or "q"))]
+        if len(fits) == 1:
+            return fits[0]
+        if fits and len({(c["from"], c["to"]) for c in fits}) == 1:
+            pick = next((c for c in fits if c["promotion"] == (promotion or "q")), None)
+            if pick is not None:
+                return pick
+        if chosen is not None and candidates:
+            message = (f"The camera does not see {chosen} on the board; it fits {', '.join(c['san'] for c in candidates)}. "
+                       "Check the pieces, then tap Done again.")
+        elif status == "unchanged":
+            message = "No move seen on the board yet. Make your move, then tap Done."
+        elif status == "uncertain":
+            message = f"The camera could not read {', '.join(scan['uncertain'])}. Check those squares, then tap Done again."
+        elif status == "ambiguous":
+            message = f"More than one move fits what the camera sees: {', '.join(c['san'] for c in candidates)}."
+        else:
+            seen = ([f"no piece on {', '.join(scan['missing'])}"] if scan["missing"] else []) + \
+                   ([f"an extra piece on {', '.join(scan['extra'])}"] if scan["extra"] else [])
+            message = ("The board does not match a legal move" + (f": the camera sees {' and '.join(seen)}" if seen else "") +
+                       ". Check the pieces, then tap Done again.")
+        raise ApiError(409, message, "board_move_unclear",
+                       **{key: scan[key] for key in ("status", "candidates", "missing", "extra", "uncertain")})
+
     # ------------------------------------------------------------------ the game
 
     def status(self, session):
@@ -461,133 +596,174 @@ class GameService:
             return self.confirm_board(session, body.get("override") is True, job_id if type(job_id) is int else None)
         if route == "/api/board-scan":
             return self.scan_board(session)
+        if route == "/api/board-move":
+            return self.board_move(session, body)
         request_id = body.get("requestId")
         if not isinstance(request_id, str) or not REQUEST_PATTERN.fullmatch(request_id):
             raise ApiError(400, "A valid requestId is required.", "invalid_request")
-        fingerprint = hashlib.sha256(json.dumps([session, route, body], sort_keys=True,
-                                                separators=(",", ":")).encode()).hexdigest()
+        fingerprint = self._fingerprint(session, route, body)
         with self.lock:
-            cached = self.db.execute("SELECT fingerprint,response FROM requests WHERE id=?", (request_id,)).fetchone()
-            if cached:
-                if not hmac.compare_digest(cached[0], fingerprint):
-                    raise ApiError(409, "requestId was already used for a different command.", "request_collision")
-                logging.info("REPLAY request=%s", request_id)
-                return json.loads(cached[1])
-            revision = body.get("expectedRevision")
-            if type(revision) is not int or not isinstance(body.get("expectedGameId"), str):
-                raise ApiError(400, "expectedGameId and integer expectedRevision are required.", "invalid_version")
-            if revision != self.record["revision"] or body["expectedGameId"] != self.record["gameId"]:
-                raise ApiError(409, "The game changed. Reload its current state.", "stale_state", state=self._snapshot(session))
-            if self._owned(session):
-                raise ApiError(409, "Another player is controlling the board.", "board_busy", state=self._snapshot(session))
-            if not self.online_active():
-                raise ApiError(409, BOARD_OFFLINE, "board_offline", state=self._snapshot(session))
-            # A new game chooses: on the physical board, or on screen only. Later requests follow the game.
-            board_game = body.get("board") is True if route == "/api/new" else self.record["board"]
-            starting_over = route == "/api/new" and board_game and self.board.driver.needs_person
-            if board_game:
-                motion = self._motion_status()
-                if motion["state"] == "fault":
-                    raise ApiError(409, "The physical board stopped. Check the pieces before moving again.", "board_fault", state=self._snapshot(session))
-                # One move at a time, all the way through the pipeline. A person can still abandon theirs,
-                # and a clock or a resignation can end the game while the board is still moving: the
-                # move in progress finishes and the reset queues behind it.
-                if motion["state"] != "idle" and not starting_over and route != "/api/end":
-                    raise ApiError(409, "Wait for the board to finish the current move.", "board_moving", state=self._snapshot(session))
-            candidate = copy.deepcopy(self.game)
-            record = copy.deepcopy(self.record)
-            extra = {}
-            if route == "/api/new":
-                level = body.get("level", "beginner")
-                if not isinstance(level, str) or level not in DIFFICULTIES:
-                    raise ApiError(400, "Choose a valid difficulty.", "invalid_level")
+            cached = self._replay(request_id, fingerprint)
+            if cached is not None:
+                return cached
+            return self._commit(route, body, session, request_id, fingerprint)
+
+    @staticmethod
+    def _fingerprint(session, route, body):
+        return hashlib.sha256(json.dumps([session, route, body], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    def _replay(self, request_id, fingerprint):
+        """Under the lock. The saved answer when this request was committed before, else None."""
+        cached = self.db.execute("SELECT fingerprint,response FROM requests WHERE id=?", (request_id,)).fetchone()
+        if not cached:
+            return None
+        if not hmac.compare_digest(cached[0], fingerprint):
+            raise ApiError(409, "requestId was already used for a different command.", "request_collision")
+        logging.info("REPLAY request=%s", request_id)
+        return json.loads(cached[1])
+
+    def _commit(self, route, body, session, request_id, fingerprint):
+        """Under the lock. Check one command against the game, apply it, and save it with its answer for replays.
+
+        /api/board-move comes here from board_move() as White's move in a board game, already read
+        off the board by the camera. It is the /api/move branch with three differences: it is the
+        board's screen asking, so the lease is not checked and stays with the website player; it
+        plays White, not the website player's Black; and nothing is planned for the gantry.
+        """
+        by_board = route == "/api/board-move"
+        revision = body.get("expectedRevision")
+        if type(revision) is not int or not isinstance(body.get("expectedGameId"), str):
+            raise ApiError(400, "expectedGameId and integer expectedRevision are required.", "invalid_version")
+        if revision != self.record["revision"] or body["expectedGameId"] != self.record["gameId"]:
+            raise ApiError(409, "The game changed. Reload its current state.", "stale_state", state=self._snapshot(session))
+        if not by_board and self._owned(session):
+            raise ApiError(409, "Another player is controlling the board.", "board_busy", state=self._snapshot(session))
+        if not self.online_active():
+            raise ApiError(409, BOARD_OFFLINE, "board_offline", state=self._snapshot(session))
+        # A new game chooses: on the physical board, or on screen only. Later requests follow the game.
+        board_game = body.get("board") is True if route == "/api/new" else self.record["board"]
+        if by_board and not board_game:
+            raise ApiError(409, "The game on the website is played on screen, not on the board.", "not_board_game")
+        if route == "/api/undo" and board_game:
+            # Two people play a board game, and a takeback would take the other player's move off the board too.
+            raise ApiError(409, NO_TAKEBACKS, "no_takebacks", state=self._snapshot(session))
+        starting_over = route == "/api/new" and board_game and self.board.driver.needs_person
+        if board_game:
+            motion = self._motion_status()
+            if motion["state"] == "fault":
+                raise ApiError(409, BOARD_STOPPED, "board_fault", state=self._snapshot(session))
+            # One move at a time, all the way through the pipeline. A person can still abandon theirs,
+            # and a clock or a resignation can end the game while the board is still moving: the
+            # move in progress finishes and the reset queues behind it.
+            if motion["state"] != "idle" and not starting_over and route != "/api/end":
+                raise ApiError(409, BOARD_STILL_MOVING, "board_moving", state=self._snapshot(session))
+        candidate = copy.deepcopy(self.game)
+        record = copy.deepcopy(self.record)
+        extra = {}
+        if route == "/api/new":
+            level = body.get("level", "beginner")
+            if not isinstance(level, str) or level not in DIFFICULTIES:
+                raise ApiError(400, "Choose a valid difficulty.", "invalid_level")
+            if not board_game:
+                # Only the digital game has Stockfish in it. A board game keeps the level but never uses it.
                 self._require_engine()
-                candidate.start(level)
-                record["gameId"] = str(uuid.uuid4())
-                record["board"] = board_game
-                record["ended"] = None
-            elif route == "/api/end":
-                # The website saw a clock reach zero or the player resign. The rules of chess have not
-                # spoken, so the record says how it ended and the snapshot shows it until the next game.
-                reason, loser = body.get("reason"), body.get("loser")
-                if reason not in ("timeout", "resignation") or loser not in ("w", "b"):
-                    raise ApiError(400, "reason must be timeout or resignation, and loser w or b.", "invalid_end")
-                if not candidate.started:
-                    raise ApiError(400, "No game has started.", "not_started")
-                if self._over(record, candidate):
-                    raise ApiError(400, GAME_OVER, "game_over")
-                record["ended"] = self._ended(reason, loser)
-            elif route == "/api/move":
-                if self._over(record, candidate):
-                    raise ApiError(400, GAME_OVER, "game_over")
-                source, target, promotion = body.get("from"), body.get("to"), body.get("promotion")
-                if not isinstance(source, str) or not isinstance(target, str) or (promotion is not None and not isinstance(promotion, str)):
-                    raise ApiError(400, "Move squares and promotion must be strings.", "invalid_move")
-                try:
-                    human_san = candidate.play_human(source, target, promotion)
-                except PromotionRequired:
-                    raise ApiError(409, "Choose a promotion piece.", "promotion_required", promotionRequired=True)
-                except ValueError as exc:
-                    raise ApiError(400, str(exc), "invalid_move") from exc
-                extra["human"] = {"uci": candidate.last_move.uci(), "san": human_san}
-                extra["computer"] = None
-                if not candidate.board.is_game_over(claim_draw=True):
-                    # Don't start a move nothing could answer.
-                    self._require_engine()
-                    if not board_game:
-                        # The digital game: Stockfish answers now, in this request. Nothing moves.
-                        move = self._digital_reply(candidate.board.copy(stack=True), candidate.level)
-                        extra["computer"] = {"uci": move.uci(), "san": candidate.play_computer(move)}
-                    # In a board game Stockfish moves later, in the pipeline, once the board shows this move.
+            candidate.start(level)
+            record["gameId"] = str(uuid.uuid4())
+            record["board"] = board_game
+            record["ended"] = None
+        elif route == "/api/end":
+            # The website saw a clock reach zero or the player resign. The rules of chess have not
+            # spoken, so the record says how it ended and the snapshot shows it until the next game.
+            reason, loser = body.get("reason"), body.get("loser")
+            if reason not in ("timeout", "resignation") or loser not in ("w", "b"):
+                raise ApiError(400, "reason must be timeout or resignation, and loser w or b.", "invalid_end")
+            if not candidate.started:
+                raise ApiError(400, "No game has started.", "not_started")
+            if self._over(record, candidate):
+                raise ApiError(400, GAME_OVER, "game_over")
+            record["ended"] = self._ended(reason, loser)
+        elif route in ("/api/move", "/api/board-move"):
+            if self._over(record, candidate):
+                raise ApiError(400, GAME_OVER, "game_over")
+            # Whose move this is: the digital game's website player is White. In a board game the person
+            # at the board is White, through the board's screen, and the website player is Black.
+            color = chess.WHITE if by_board or not board_game else chess.BLACK
+            if board_game and candidate.started and candidate.board.turn != color:
+                if by_board:
+                    raise ApiError(409, ONLINE_PLAYER_TO_MOVE, "not_board_turn", state=self._snapshot(session))
+                raise ApiError(409, BOARD_PLAYS_WHITE, "not_your_turn", state=self._snapshot(session))
+            source, target, promotion = body.get("from"), body.get("to"), body.get("promotion")
+            if not isinstance(source, str) or not isinstance(target, str) or (promotion is not None and not isinstance(promotion, str)):
+                raise ApiError(400, "Move squares and promotion must be strings.", "invalid_move")
+            try:
+                san = candidate.play_human(source, target, promotion, color)
+            except PromotionRequired:
+                raise ApiError(409, "Choose a promotion piece.", "promotion_required", promotionRequired=True)
+            except ValueError as exc:
+                raise ApiError(400, str(exc), "invalid_move") from exc
+            played = {"uci": candidate.last_move.uci(), "san": san}
+            if by_board:
+                extra["boardMove"] = played
             else:
-                if not candidate.started or not candidate.board.move_stack:
-                    raise ApiError(400, "Nothing to take back.", "nothing_to_undo")
-                if self._over(record, candidate):
-                    # A finished board game has sent its pieces home; a takeback would replay the whole game onto the board.
-                    raise ApiError(400, GAME_OVER, "game_over")
-                count = min(2 if candidate.board.turn == chess.WHITE else 1, len(candidate.board.move_stack))
-                for _ in range(count):
-                    candidate.board.pop()
-                    candidate.san_moves.pop()
-                candidate.last_move = candidate.board.peek() if candidate.board.move_stack else None
-                extra["undone"] = count
-            record.update(revision=record["revision"] + 1, started=candidate.started,
-                          level=candidate.level, uciMoves=[m.uci() for m in candidate.board.move_stack],
-                          owner=session, leaseExpiresAt=self.clock() + self.lease_seconds)
-            jobs = []
-            if board_game:
-                # From wherever the physical pieces last were (digital games never move them) to this game.
-                jobs = plan_transition(self.record["boardMoves"], record["uciMoves"], new_game=route == "/api/new")
-                # A person sets up the board once, whatever was still queued, and as in pi_game.py
-                # it is checked before the first move.
-                if starting_over:
-                    jobs = [starting_position_check()]
-                if route == "/api/move" and body.get("fromBoard") is True:
-                    # The camera read this move off the board, so the piece is already there.
-                    jobs = jobs[1:]
-                record["boardMoves"] = list(record["uciMoves"])
-            if route != "/api/new" and self._over(record, candidate):
-                # Checkmate, a draw, a clock or a resignation: the lease ends with the game, and a board game
-                # puts its pieces back behind whatever this request still owes the board.
-                jobs += self._close_game(record)
-            # The game and the signals it owes the board commit together, or not at all.
-            with self.db:
-                self.db.execute("UPDATE state SET value=? WHERE id=1", (json.dumps(record),))
-                released = self.board.drop_queued() if starting_over else None
-                for job in jobs:
-                    self.board.queue(job)
-                response = {**self._snapshot(session, record, candidate), **extra, "requestId": request_id}
-                self.db.execute("INSERT INTO requests VALUES(?,?,?)", (request_id, fingerprint, json.dumps(response)))
-            self.record, self.game = record, candidate
-            if released:
-                # Release the worker, which is still waiting on a step that no longer exists.
-                self.board.abandoned_job = released
-            self.board.ready.notify()
-            logging.info("COMMIT route=%s request=%s game=%s revision=%s %s player=%s fen=%s%s",
-                         route, request_id, record["gameId"], record["revision"], "board" if board_game else "digital",
-                         extra.get("human", {}).get("uci", "-"), candidate.board.fen(),
-                         f" ended={record['ended']['reason']}" if record["ended"] else "")
-            return response
+                extra["human"], extra["computer"] = played, None
+            if not board_game and not candidate.board.is_game_over(claim_draw=True):
+                # The digital game: Stockfish answers now, in this request. Nothing moves.
+                self._require_engine()
+                move = self._digital_reply(candidate.board.copy(stack=True), candidate.level)
+                extra["computer"] = {"uci": move.uci(), "san": candidate.play_computer(move)}
+            # In a board game the other player answers: White on the board, or Black on the website.
+        else:
+            if not candidate.started or not candidate.board.move_stack:
+                raise ApiError(400, "Nothing to take back.", "nothing_to_undo")
+            if self._over(record, candidate):
+                raise ApiError(400, GAME_OVER, "game_over")
+            count = min(2 if candidate.board.turn == chess.WHITE else 1, len(candidate.board.move_stack))
+            for _ in range(count):
+                candidate.board.pop()
+                candidate.san_moves.pop()
+            candidate.last_move = candidate.board.peek() if candidate.board.move_stack else None
+            extra["undone"] = count
+        record.update(revision=record["revision"] + 1, started=candidate.started,
+                      level=candidate.level, uciMoves=[m.uci() for m in candidate.board.move_stack])
+        if not by_board:
+            record.update(owner=session, leaseExpiresAt=self.clock() + self.lease_seconds)
+        elif record["owner"] is not None:
+            # The screen never takes the game: the website player keeps it, for a full lease from this move.
+            record["leaseExpiresAt"] = self.clock() + self.lease_seconds
+        jobs = []
+        if board_game:
+            # From wherever the physical pieces last were (digital games never move them) to this game.
+            # A move read off the board is already there, so only what came before it is planned: normally nothing.
+            target = self.record["uciMoves"] if by_board else record["uciMoves"]
+            jobs = plan_transition(self.record["boardMoves"], target, new_game=route == "/api/new")
+            # A person sets up the board once, whatever was still queued, and as in pi_game.py
+            # it is checked before the first move.
+            if starting_over:
+                jobs = [starting_position_check()]
+            record["boardMoves"] = list(record["uciMoves"])
+        if route != "/api/new" and self._over(record, candidate):
+            # Checkmate, a draw, a clock or a resignation: the lease ends with the game, and a board game
+            # puts its pieces back behind whatever this request still owes the board.
+            jobs += self._close_game(record)
+        # The game and the signals it owes the board commit together, or not at all.
+        with self.db:
+            self.db.execute("UPDATE state SET value=? WHERE id=1", (json.dumps(record),))
+            released = self.board.drop_queued() if starting_over else None
+            for job in jobs:
+                self.board.queue(job)
+            response = {**self._snapshot(session, record, candidate), **extra, "requestId": request_id}
+            self.db.execute("INSERT INTO requests VALUES(?,?,?)", (request_id, fingerprint, json.dumps(response)))
+        self.record, self.game = record, candidate
+        if released:
+            # Release the worker, which is still waiting on a step that no longer exists.
+            self.board.abandoned_job = released
+        self.board.ready.notify()
+        played = extra.get("human") or extra.get("boardMove") or {}
+        logging.info("COMMIT route=%s request=%s game=%s revision=%s %s move=%s fen=%s%s",
+                     route, request_id, record["gameId"], record["revision"], "board" if board_game else "digital",
+                     played.get("uci", "-"), candidate.board.fen(),
+                     f" ended={record['ended']['reason']}" if record["ended"] else "")
+        return response
 
     def close(self):
         self.board.close()
